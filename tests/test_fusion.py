@@ -809,3 +809,81 @@ class TestPublicAPI:
         assert ReadPipeline is not None
         assert RankedFact is not None
         assert MemoryCore is not None
+
+
+# ── Shared Helper Tests ─────────────────────────────────────────────────
+
+
+class TestStripMarkdownJson:
+    def test_plain_json(self):
+        from hy_memory_fusion._utils import strip_markdown_json
+        assert strip_markdown_json('[{"a": 1}]') == '[{"a": 1}]'
+
+    def test_json_code_block(self):
+        from hy_memory_fusion._utils import strip_markdown_json
+        input_text = '```\n[{"a": 1}]\n```'
+        result = strip_markdown_json(input_text)
+        assert result == '[{"a": 1}]'
+
+    def test_json_with_lang_tag(self):
+        from hy_memory_fusion._utils import strip_markdown_json
+        input_text = '```json\n[{"a": 1}]\n```'
+        result = strip_markdown_json(input_text)
+        assert '"a"' in result
+
+    def test_strips_whitespace(self):
+        from hy_memory_fusion._utils import strip_markdown_json
+        assert strip_markdown_json('  [1]  ') == '[1]'
+
+
+class TestEmbedHelpers:
+    @pytest.mark.asyncio
+    async def test_embed_text_success(self):
+        from hy_memory_fusion._utils import embed_text
+        client = mock_embed_client([[0.1, 0.2, 0.3]])
+        result = await embed_text("test", client, "model", max_retries=1, delay=0.01)
+        assert result == [0.1, 0.2, 0.3]
+
+    @pytest.mark.asyncio
+    async def test_embed_text_failure_returns_empty(self):
+        from hy_memory_fusion._utils import embed_text
+        client = AsyncMock()
+        client.embeddings.create = AsyncMock(side_effect=Exception("boom"))
+        result = await embed_text("test", client, "model", max_retries=0, delay=0.01)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_embed_batch_success(self):
+        from hy_memory_fusion._utils import embed_batch
+        client = mock_embed_client([[0.1, 0.2], [0.3, 0.4]])
+        result = await embed_batch(["a", "b"], client, "model", batch_size=2, max_retries=1, delay=0.01)
+        assert len(result) == 2
+        assert result[0] == [0.1, 0.2]
+        assert result[1] == [0.3, 0.4]
+
+    @pytest.mark.asyncio
+    async def test_embed_batch_empty_input(self):
+        from hy_memory_fusion._utils import embed_batch
+        result = await embed_batch([], mock_embed_client(), "model")
+        assert result == []
+
+
+class TestHybridSearchVectorFix:
+    @pytest.mark.asyncio
+    async def test_hybrid_mode_uses_vectors(self):
+        """Verify hybrid_search passes vectors to rank() after fix."""
+        core = TestMemoryCore()._make_core()
+        now = datetime.now(timezone.utc).isoformat()
+
+        mock_point = MagicMock()
+        mock_point.id = "f1"
+        mock_point.score = 0.95
+        mock_point.vector = [0.9, 0.1, 0.0, 0.0]
+        mock_point.payload = {"text": "test fact", "importance": 0.8, "created_at": now, "access_count": 5}
+        core._qdrant.search = AsyncMock(return_value=[mock_point])
+
+        core.embed = AsyncMock(return_value=[0.9, 0.1, 0.0, 0.0])
+
+        results = await core.hybrid_search("test", mode="hybrid")
+        assert len(results) == 1
+        assert results[0]["semantic_score"] > 0.9

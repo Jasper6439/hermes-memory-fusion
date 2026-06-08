@@ -257,7 +257,7 @@ class MemoryCore:
     async def hybrid_search(
         self,
         query: str,
-        mode: Literal["semantic", "hybrid", "fusion"] = "hybrid",
+        mode: Literal["semantic", "hybrid"] = "hybrid",
         limit: int = 10,
         filters: Optional[dict[str, Any]] = None,
         user_id: str = "default",
@@ -296,6 +296,7 @@ class MemoryCore:
             limit=limit,
             query_filter=qdrant_filter,
             with_payload=True,
+            with_vectors=True,
         )
 
         if mode == "semantic":
@@ -309,14 +310,14 @@ class MemoryCore:
                 for point in results
             ]
 
-        # hybrid / fusion: use full read pipeline ranking
+        # hybrid: use full read pipeline ranking with multi-signal scoring
         raw = [
             {
                 "fact_id": point.id,
                 "text": point.payload.get("text", ""),
                 "score": point.score,
-                "embedding": point.payload.get("embedding", []),
-                **{k: v for k, v in (point.payload or {}).items() if k not in ("text", "embedding")},
+                "embedding": point.vector or [],
+                **{k: v for k, v in (point.payload or {}).items() if k != "text"},
             }
             for point in results
         ]

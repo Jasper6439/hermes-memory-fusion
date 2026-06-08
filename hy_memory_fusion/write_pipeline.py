@@ -18,7 +18,7 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 from hy_memory_fusion.config import FusionConfig
-from hy_memory_fusion._utils import retry, cosine_similarity
+from hy_memory_fusion._utils import retry, cosine_similarity, embed_text, embed_batch, strip_markdown_json
 
 logger = logging.getLogger(__name__)
 
@@ -163,10 +163,7 @@ class WritePipeline:
             )
 
             # Parse JSON (handle markdown code blocks)
-            content = content.strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-                content = content.rsplit("```", 1)[0]
+            content = strip_markdown_json(content)
             items = json.loads(content)
 
             facts: list[ExtractedFact] = []
@@ -246,57 +243,25 @@ class WritePipeline:
 
     async def embed(self, text: str) -> list[float]:
         """Public embedding method (shared with MemoryCore)."""
-        return await self._embed(text)
+        return await embed_text(
+            text, self.embed_client, self.config.embedder.model,
+            max_retries=self.config.pipeline.max_retries,
+            delay=self.config.pipeline.retry_delay,
+        )
 
     async def _embed(self, text: str) -> list[float]:
         """Get embedding vector for single text."""
-
-        async def _call():
-            resp = await self.embed_client.embeddings.create(
-                model=self.config.embedder.model,
-                input=text,
-            )
-            return resp.data[0].embedding
-
-        try:
-            return await retry(
-                _call,
-                max_retries=self.config.pipeline.max_retries,
-                delay=self.config.pipeline.retry_delay,
-                label="embed",
-            )
-        except Exception as e:
-            logger.error("Embedding failed: %s", e)
-            return []
+        return await embed_text(
+            text, self.embed_client, self.config.embedder.model,
+            max_retries=self.config.pipeline.max_retries,
+            delay=self.config.pipeline.retry_delay,
+        )
 
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Batch embed multiple texts in a single API call."""
-        if not texts:
-            return []
-
-        batch_size = self.config.embedder.batch_size
-        all_embeddings: list[list[float]] = []
-
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-
-            async def _call(b=batch):
-                resp = await self.embed_client.embeddings.create(
-                    model=self.config.embedder.model,
-                    input=b,
-                )
-                return [d.embedding for d in resp.data]
-
-            try:
-                embeddings = await retry(
-                    _call,
-                    max_retries=self.config.pipeline.max_retries,
-                    delay=self.config.pipeline.retry_delay,
-                    label=f"embed_batch[{i}:{i+batch_size}]",
-                )
-                all_embeddings.extend(embeddings)
-            except Exception as e:
-                logger.error("Batch embedding failed: %s", e)
-                all_embeddings.extend([[] for _ in batch])
-
-        return all_embeddings
+        return await embed_batch(
+            texts, self.embed_client, self.config.embedder.model,
+            self.config.embedder.batch_size,
+            max_retries=self.config.pipeline.max_retries,
+            delay=self.config.pipeline.retry_delay,
+        )

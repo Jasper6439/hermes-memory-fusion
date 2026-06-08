@@ -19,7 +19,7 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 from hy_memory_fusion.config import FusionConfig
-from hy_memory_fusion._utils import retry, cosine_similarity
+from hy_memory_fusion._utils import retry, cosine_similarity, embed_text, strip_markdown_json
 
 logger = logging.getLogger(__name__)
 
@@ -186,11 +186,7 @@ class ReadPipeline:
             )
 
             # Parse JSON response
-            content = content.strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-                content = content.rsplit("```", 1)[0]
-
+            content = strip_markdown_json(content)
             result = json.loads(content)
             return {
                 "answer": result.get("answer", content),
@@ -285,21 +281,8 @@ class ReadPipeline:
 
     async def _embed(self, text: str) -> list[float]:
         """Get embedding vector for text."""
-
-        async def _call():
-            resp = await self.embed_client.embeddings.create(
-                model=self.config.embedder.model,
-                input=text,
-            )
-            return resp.data[0].embedding
-
-        try:
-            return await retry(
-                _call,
-                max_retries=self.config.pipeline.max_retries,
-                delay=self.config.pipeline.retry_delay,
-                label="query_embed",
-            )
-        except Exception as e:
-            logger.error("Query embedding failed: %s", e)
-            return []
+        return await embed_text(
+            text, self.embed_client, self.config.embedder.model,
+            max_retries=self.config.pipeline.max_retries,
+            delay=self.config.pipeline.retry_delay,
+        )

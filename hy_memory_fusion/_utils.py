@@ -45,6 +45,96 @@ async def retry(
     raise last_exc  # type: ignore[misc]
 
 
+async def embed_text(
+    text: str,
+    embed_client: Any,
+    model: str,
+    *,
+    max_retries: int = 2,
+    delay: float = 1.0,
+) -> list[float]:
+    """Shared single-text embedding helper with retry.
+
+    Args:
+        text: Text to embed.
+        embed_client: AsyncOpenAI-compatible client.
+        model: Model name.
+        max_retries: Max retry attempts.
+        delay: Base retry delay.
+
+    Returns:
+        Embedding vector, or empty list on failure.
+    """
+
+    async def _call():
+        resp = await embed_client.embeddings.create(model=model, input=text)
+        return resp.data[0].embedding
+
+    try:
+        return await retry(_call, max_retries=max_retries, delay=delay, label="embed")
+    except Exception as e:
+        logger.error("Embedding failed: %s", e)
+        return []
+
+
+async def embed_batch(
+    texts: list[str],
+    embed_client: Any,
+    model: str,
+    batch_size: int = 32,
+    *,
+    max_retries: int = 2,
+    delay: float = 1.0,
+) -> list[list[float]]:
+    """Shared batch embedding helper with retry.
+
+    Args:
+        texts: Texts to embed.
+        embed_client: AsyncOpenAI-compatible client.
+        model: Model name.
+        batch_size: Max texts per API call.
+        max_retries: Max retry attempts per batch.
+        delay: Base retry delay.
+
+    Returns:
+        List of embedding vectors (one per input text).
+    """
+    if not texts:
+        return []
+
+    all_embeddings: list[list[float]] = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+
+        async def _call(b=batch):
+            resp = await embed_client.embeddings.create(model=model, input=b)
+            return [d.embedding for d in resp.data]
+
+        try:
+            embeddings = await retry(
+                _call, max_retries=max_retries, delay=delay,
+                label=f"embed_batch[{i}:{i+batch_size}]",
+            )
+            all_embeddings.extend(embeddings)
+        except Exception as e:
+            logger.error("Batch embedding failed: %s", e)
+            all_embeddings.extend([[] for _ in batch])
+
+    return all_embeddings
+
+
+def strip_markdown_json(text: str) -> str:
+    """Strip markdown code block wrappers from LLM JSON responses.
+
+    Handles ```json...``` and ```...``` patterns.
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        text = text.rsplit("```", 1)[0]
+    return text.strip()
+
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors.
 
