@@ -18,7 +18,7 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 from hy_memory_fusion.config import FusionConfig
-from hy_memory_fusion._utils import retry
+from hy_memory_fusion._utils import retry, cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,14 @@ class WritePipeline:
             existing_facts: List of existing fact dicts for dedup (from Qdrant).
                 Each dict must have at least 'text' and optionally 'fact_id'.
         """
+        # Truncate extremely long input to protect against token overflow
+        MAX_INPUT_CHARS = 50_000  # ~12k tokens for most models
+        if len(text) > MAX_INPUT_CHARS:
+            logger.warning(
+                "Input text truncated from %d to %d chars", len(text), MAX_INPUT_CHARS
+            )
+            text = text[:MAX_INPUT_CHARS]
+
         if not self.config.distillation.enabled:
             # Bypass: store raw text as single fact
             fact = ExtractedFact(subject=text[:50], relation="is", object="raw_note", importance=0.3)
@@ -210,7 +218,7 @@ class WritePipeline:
             for existing_emb in existing_embeddings:
                 if existing_emb is None:
                     continue
-                sim = _cosine_similarity(fact.embedding, existing_emb)
+                sim = cosine_similarity(fact.embedding, existing_emb)
                 if sim >= threshold:
                     logger.debug("Dedup: '%s' is duplicate (sim=%.3f)", fact.text, sim)
                     is_dup = True
@@ -221,7 +229,7 @@ class WritePipeline:
                 for kept_fact in kept:
                     if not kept_fact.embedding:
                         continue
-                    sim = _cosine_similarity(fact.embedding, kept_fact.embedding)
+                    sim = cosine_similarity(fact.embedding, kept_fact.embedding)
                     if sim >= threshold:
                         logger.debug("Intra-batch dedup: '%s' vs '%s' (sim=%.3f)", fact.text, kept_fact.text, sim)
                         is_dup = True
@@ -292,15 +300,3 @@ class WritePipeline:
                 all_embeddings.extend([[] for _ in batch])
 
         return all_embeddings
-
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    if len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)

@@ -12,7 +12,6 @@ requires-python = ">=3.10"
 dependencies = [
     "openai>=1.0",
     "qdrant-client>=1.7",
-    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

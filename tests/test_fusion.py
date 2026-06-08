@@ -21,7 +21,8 @@ from hy_memory_fusion.config import (
     RecallConfig,
     PipelineConfig,
 )
-from hy_memory_fusion.write_pipeline import WritePipeline, ExtractedFact, _cosine_similarity
+from hy_memory_fusion._utils import cosine_similarity
+from hy_memory_fusion.write_pipeline import WritePipeline, ExtractedFact
 from hy_memory_fusion.read_pipeline import ReadPipeline, RankedFact
 from hy_memory_fusion.memory_core import MemoryCore
 
@@ -259,19 +260,19 @@ class TestWritePipeline:
 
 class TestCosineSimilarity:
     def test_identical(self):
-        assert _cosine_similarity([1, 0, 0], [1, 0, 0]) == pytest.approx(1.0)
+        assert cosine_similarity([1, 0, 0], [1, 0, 0]) == pytest.approx(1.0)
 
     def test_orthogonal(self):
-        assert _cosine_similarity([1, 0], [0, 1]) == pytest.approx(0.0)
+        assert cosine_similarity([1, 0], [0, 1]) == pytest.approx(0.0)
 
     def test_opposite(self):
-        assert _cosine_similarity([1, 0], [-1, 0]) == pytest.approx(-1.0)
+        assert cosine_similarity([1, 0], [-1, 0]) == pytest.approx(-1.0)
 
     def test_zero_vector(self):
-        assert _cosine_similarity([0, 0], [1, 0]) == 0.0
+        assert cosine_similarity([0, 0], [1, 0]) == 0.0
 
     def test_different_lengths(self):
-        assert _cosine_similarity([1, 0], [1, 0, 0]) == 0.0
+        assert cosine_similarity([1, 0], [1, 0, 0]) == 0.0
 
 
 # ── Read Pipeline Tests ──────────────────────────────────────────────────
@@ -680,3 +681,131 @@ class TestConfigEdgeCases:
         for key in ["FUSION_RECALL_SEMANTIC_WEIGHT", "FUSION_RECALL_RECENCY_WEIGHT",
                      "FUSION_RECALL_IMPORTANCE_WEIGHT", "FUSION_RECALL_ACCESS_WEIGHT"]:
             del os.environ[key]
+
+
+# ── Weight Validation Tests ─────────────────────────────────────────────
+
+
+class TestRecallConfigValidation:
+    def test_default_weights_no_warning(self):
+        """Default weights sum to 1.0 — no warning."""
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            RecallConfig()  # should NOT raise
+
+    def test_custom_weights_no_warning(self):
+        """Custom weights that sum to 1.0 — no warning."""
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            RecallConfig(
+                semantic_weight=0.5,
+                recency_weight=0.2,
+                importance_weight=0.25,
+                access_weight=0.05,
+            )
+
+    def test_unbalanced_weights_warns(self):
+        """Weights that don't sum to 1.0 — should emit RuntimeWarning."""
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            RecallConfig(
+                semantic_weight=0.8,
+                recency_weight=0.3,
+                importance_weight=0.3,
+                access_weight=0.1,
+            )  # sum = 1.5
+            assert len(w) == 1
+            assert issubclass(w[0].category, RuntimeWarning)
+            assert "1.500" in str(w[0].message)
+
+
+# ── Input Truncation Tests ──────────────────────────────────────────────
+
+
+class TestInputTruncation:
+    @pytest.mark.asyncio
+    async def test_short_text_not_truncated(self):
+        """Normal-length text passes through unchanged."""
+        svo_response = json.dumps([
+            {"subject": "test", "relation": "is", "object": "fact", "importance": 0.5},
+        ])
+        config = make_config()
+        writer = WritePipeline(
+            config,
+            mock_llm_client(svo_response),
+            mock_embed_client(),
+        )
+        facts = await writer.ingest("Short text")
+        assert len(facts) == 1
+
+    @pytest.mark.asyncio
+    async def test_long_text_truncated(self):
+        """Text over 50k chars gets truncated."""
+        config = make_config()
+        captured_prompts = []
+
+        llm = AsyncMock()
+        msg = MagicMock()
+        msg.content = json.dumps([
+            {"subject": "truncated", "relation": "is", "object": "text", "importance": 0.5},
+        ])
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+
+        async def capture_call(**kwargs):
+            captured_prompts.append(kwargs["messages"][0]["content"])
+            return resp
+
+        llm.chat.completions.create = AsyncMock(side_effect=capture_call)
+
+        writer = WritePipeline(config, llm, mock_embed_client())
+        long_text = "x" * 60_000
+
+        facts = await writer.ingest(long_text)
+
+        # The prompt should contain truncated text (50k chars + SVO prompt template)
+        assert len(captured_prompts) == 1
+        assert len(captured_prompts[0]) < 60_000 + 500
+
+
+# ── Public API Tests ────────────────────────────────────────────────────
+
+
+class TestPublicAPI:
+    def test_cosine_similarity_importable_from_utils(self):
+        """cosine_similarity is a public function importable from _utils."""
+        from hy_memory_fusion._utils import cosine_similarity
+        assert callable(cosine_similarity)
+        assert cosine_similarity([1, 0], [1, 0]) == pytest.approx(1.0)
+
+    def test_retry_importable_from_utils(self):
+        """retry is a public function importable from _utils."""
+        from hy_memory_fusion._utils import retry
+        assert callable(retry)
+
+    def test_version_exported(self):
+        """Package exports version."""
+        from hy_memory_fusion import __version__
+        assert __version__ == "0.2.0"
+
+    def test_all_public_classes_exported(self):
+        """All public classes are exported from __init__."""
+        from hy_memory_fusion import (
+            FusionConfig,
+            WritePipeline,
+            ExtractedFact,
+            ReadPipeline,
+            RankedFact,
+            MemoryCore,
+        )
+        assert FusionConfig is not None
+        assert WritePipeline is not None
+        assert ExtractedFact is not None
+        assert ReadPipeline is not None
+        assert RankedFact is not None
+        assert MemoryCore is not None

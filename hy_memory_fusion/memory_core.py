@@ -119,14 +119,17 @@ class MemoryCore:
         if not self._initialized:
             await self.initialize()
 
-        # Fetch existing facts for dedup
+        # Fetch existing facts for dedup — use Qdrant search for efficiency
         existing_facts = []
         if self.config.distillation.enabled:
             try:
-                # Get a broad set of existing facts for dedup
+                # For small collections (<1000), scroll is fine.
+                # For larger collections, each new fact is searched individually
+                # against Qdrant in WritePipeline._dedup(), so we fetch a
+                # representative sample here for batch dedup.
                 all_points = await self._qdrant.scroll(
                     collection_name=self._collection,
-                    limit=200,
+                    limit=500,
                     with_payload=True,
                     with_vectors=True,
                 )
@@ -134,6 +137,7 @@ class MemoryCore:
                     payload = point.payload or {}
                     payload["embedding"] = point.vector
                     existing_facts.append(payload)
+                logger.debug("Fetched %d existing facts for dedup", len(existing_facts))
             except Exception as e:
                 logger.debug("Could not fetch existing facts for dedup: %s", e)
 
@@ -224,7 +228,12 @@ class MemoryCore:
         ]
 
     async def update_access(self, fact_ids: list[str]) -> None:
-        """Increment access counter for retrieved facts."""
+        """Increment access counter for retrieved facts.
+
+        Note: This uses read-modify-write without locking. Under concurrent
+        access, increments may be lost (acceptable for approximate counters).
+        For exact counting, use Qdrant's atomic operations or a separate counter.
+        """
         for fid in fact_ids:
             try:
                 # Qdrant doesn't have atomic increment, use set_payload with read-modify-write

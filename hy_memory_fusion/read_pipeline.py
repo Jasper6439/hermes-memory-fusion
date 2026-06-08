@@ -19,7 +19,7 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 from hy_memory_fusion.config import FusionConfig
-from hy_memory_fusion._utils import retry
+from hy_memory_fusion._utils import retry, cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -217,8 +217,6 @@ class ReadPipeline:
 
         Uses RecallConfig weights to combine signals.
         """
-        from hy_memory_fusion.write_pipeline import _cosine_similarity
-
         cfg = self.config.recall
         now = datetime.now(timezone.utc)
         ranked: list[RankedFact] = []
@@ -226,7 +224,7 @@ class ReadPipeline:
         for result in raw_results:
             # 1. Semantic similarity
             vec = result.get("embedding") or result.get("vector") or []
-            sem_score = _cosine_similarity(query_embedding, vec) if vec else 0.0
+            sem_score = cosine_similarity(query_embedding, vec) if vec else 0.0
 
             # 2. Recency score (exponential decay, half-life = 30 days)
             created = result.get("created_at", "")

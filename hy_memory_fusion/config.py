@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 
 
@@ -49,7 +50,11 @@ class DistillationConfig:
 
 @dataclass
 class RecallConfig:
-    """Read pipeline retrieval configuration."""
+    """Read pipeline retrieval configuration.
+
+    Weights should sum to ~1.0 for interpretable combined scores.
+    A RuntimeWarning is emitted if they deviate by more than 0.01.
+    """
 
     max_results: int = 10
     min_score: float = 0.3
@@ -57,6 +62,16 @@ class RecallConfig:
     recency_weight: float = 0.15
     importance_weight: float = 0.2
     access_weight: float = 0.05
+
+    def __post_init__(self) -> None:
+        total = self.semantic_weight + self.recency_weight + self.importance_weight + self.access_weight
+        if abs(total - 1.0) > 0.01:
+            warnings.warn(
+                f"RecallConfig weights sum to {total:.3f}, expected ~1.0. "
+                f"Scores may not be interpretable.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
 @dataclass

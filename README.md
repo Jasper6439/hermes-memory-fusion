@@ -24,19 +24,22 @@ A hybrid memory system combining **Hy-Memory's write pipeline** (SVO extraction 
 ## Write Pipeline (from Hy-Memory)
 
 - **SVO Extraction**: LLM extracts Subject-Verb-Object triplets from raw text
-- **Batch Embedding**: Single API call for all extracted facts
-- **Semantic Deduplication**: Cosine similarity threshold (default 0.92) removes duplicates against existing memories
+- **Batch Embedding**: Single API call for all extracted facts (configurable batch size)
+- **Semantic Deduplication**: Cosine similarity threshold (default 0.92) removes duplicates
+  - Against existing memories in Qdrant
+  - Intra-batch dedup (new facts checked against each other)
 - **Importance Filtering**: Only stores facts above configurable threshold (default 0.3)
+- **Input Truncation**: Text over 50k chars auto-truncated to prevent token overflow
 
 ## Read Pipeline (from Honcho)
 
-- **Multi-Signal Ranking**: Four weighted signals:
+- **Multi-Signal Ranking**: Four weighted signals (configurable, validated to sum ~1.0):
   - Semantic similarity (60%) — cosine similarity of query vs fact embeddings
   - Recency (15%) — exponential decay with 30-day half-life
   - Importance (20%) — fact's self-assigned importance score
   - Access frequency (5%) — logarithmic saturation at ~10 accesses
 - **Dialectic Reasoning**: 5 levels (minimal → max) with appropriate prompt depth
-- **Access Counter Updates**: Fire-and-forget increment on retrieval
+- **Access Counter Updates**: Fire-and-forget increment on retrieval (approximate, see caveats)
 
 ## Quick Start
 
@@ -69,6 +72,7 @@ All config via environment variables:
 | `FUSION_WRITER_MODEL` | same as LLM | SVO extraction model |
 | `FUSION_READER_MODEL` | local llama-server | Synthesis model |
 | `FUSION_EMBEDDER_MODEL` | mxbai-embed-large | Embedding model |
+| `FUSION_EMBEDDER_BATCH_SIZE` | 32 | Batch size for embedding calls |
 | `FUSION_QDRANT_URL` | localhost:6333 | Qdrant endpoint |
 | `FUSION_DEDUP_THRESHOLD` | 0.92 | Dedup similarity threshold |
 | `FUSION_PIPELINE_MAX_RETRIES` | 2 | LLM call retries |
@@ -87,6 +91,12 @@ pytest tests/ -v
 # With coverage
 pytest tests/ -v --cov=hy_memory_fusion --cov-report=term-missing
 ```
+
+## Caveats
+
+- **Access counters** use read-modify-write without locking. Under concurrent access, increments may be lost. This is acceptable for approximate ranking but not for exact counting.
+- **Dedup scaling**: Current implementation is O(n×m) for n new facts × m existing facts. For collections >10k facts, consider using Qdrant's native vector search for dedup.
+- **Weight validation**: RecallConfig warns if weights don't sum to ~1.0, but doesn't enforce it.
 
 ## Three-Layer Memory Architecture
 
