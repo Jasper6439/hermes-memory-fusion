@@ -266,8 +266,7 @@ class MemoryCore:
 
         Modes:
         - semantic: Pure vector similarity
-        - hybrid: Vector + metadata filters
-        - fusion: Multi-query fusion (planned)
+        - hybrid: Vector + multi-signal metadata ranking
         """
         if not self._initialized:
             await self.initialize()
