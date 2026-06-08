@@ -354,7 +354,7 @@ class TestQdrantBenchmark:
 
         start = time.perf_counter()
         for _ in range(iterations):
-            await client.search(collection_name=collection, query_vector=query, limit=10)
+            await client.query_points(collection_name=collection, query=query, limit=10)
         elapsed = time.perf_counter() - start
 
         print(f"\n  qdrant.search(1000 facts, {DIM}d) × {iterations}: {elapsed:.3f}s ({iterations/elapsed:.0f} queries/s)")
@@ -392,9 +392,9 @@ class TestQdrantBenchmark:
 
         start = time.perf_counter()
         for _ in range(iterations):
-            await client.search(
+            await client.query_points(
                 collection_name=collection,
-                query_vector=query,
+                query=query,
                 limit=10,
                 with_payload=True,
                 with_vectors=True,

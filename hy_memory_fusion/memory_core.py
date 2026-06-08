@@ -208,9 +208,9 @@ class MemoryCore:
 
         This is the vector_store interface that ReadPipeline.search() calls.
         """
-        results = await self._qdrant.search(
+        response = await self._qdrant.query_points(
             collection_name=self._collection,
-            query_vector=query_embedding,
+            query=query_embedding,
             limit=limit,
             with_payload=True,
             with_vectors=True,
@@ -224,7 +224,7 @@ class MemoryCore:
                 "embedding": point.vector,
                 **{k: v for k, v in (point.payload or {}).items() if k != "text"},
             }
-            for point in results
+            for point in response.points
         ]
 
     async def update_access(self, fact_ids: list[str]) -> None:
@@ -289,9 +289,9 @@ class MemoryCore:
             qdrant_filter = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
 
         # Search
-        results = await self._qdrant.search(
+        response = await self._qdrant.query_points(
             collection_name=self._collection,
-            query_vector=query_embedding,
+            query=query_embedding,
             limit=limit,
             query_filter=qdrant_filter,
             with_payload=True,
@@ -306,7 +306,7 @@ class MemoryCore:
                     "score": point.score,
                     **{k: v for k, v in (point.payload or {}).items() if k != "text"},
                 }
-                for point in results
+                for point in response.points
             ]
 
         # hybrid: use full read pipeline ranking with multi-signal scoring
@@ -318,7 +318,7 @@ class MemoryCore:
                 "embedding": point.vector or [],
                 **{k: v for k, v in (point.payload or {}).items() if k != "text"},
             }
-            for point in results
+            for point in response.points
         ]
         ranked = self._reader.rank(query_embedding, raw)
         return [r.to_dict() for r in ranked[:limit]]

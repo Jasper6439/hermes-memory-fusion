@@ -395,7 +395,7 @@ class TestMemoryCore:
         mock_qdrant = AsyncMock()
         mock_qdrant.get_collections = AsyncMock(return_value=MagicMock(collections=[]))
         mock_qdrant.create_collection = AsyncMock()
-        mock_qdrant.search = AsyncMock(return_value=[])
+        mock_qdrant.query_points = AsyncMock(return_value=MagicMock(points=[]))
         mock_qdrant.scroll = AsyncMock(return_value=([], None))
         mock_qdrant.upsert = AsyncMock()
         mock_qdrant.retrieve = AsyncMock(return_value=[])
@@ -473,7 +473,7 @@ class TestMemoryCore:
         mock_point.id = "f1"
         mock_point.score = 0.95
         mock_point.payload = {"text": "test", "importance": 0.8}
-        core._qdrant.search = AsyncMock(return_value=[mock_point])
+        core._qdrant.query_points = AsyncMock(return_value=MagicMock(points=[mock_point]))
 
         results = await core.hybrid_search("test", mode="semantic")
         assert len(results) == 1
@@ -609,7 +609,7 @@ class TestHybridSearchModes:
         mock_point.id = "f1"
         mock_point.score = 0.95
         mock_point.payload = {"text": "test fact", "importance": 0.8, "created_at": now, "access_count": 5}
-        core._qdrant.search = AsyncMock(return_value=[mock_point])
+        core._qdrant.query_points = AsyncMock(return_value=MagicMock(points=[mock_point]))
 
         results = await core.hybrid_search("test", mode="hybrid")
         assert len(results) == 1
@@ -623,7 +623,7 @@ class TestHybridSearchModes:
         mock_point.id = "f1"
         mock_point.score = 0.95
         mock_point.payload = {"text": "test fact", "importance": 0.8}
-        core._qdrant.search = AsyncMock(return_value=[mock_point])
+        core._qdrant.query_points = AsyncMock(return_value=MagicMock(points=[mock_point]))
 
         results = await core.hybrid_search("test", mode="semantic")
         assert len(results) == 1
@@ -880,7 +880,7 @@ class TestHybridSearchVectorFix:
         mock_point.score = 0.95
         mock_point.vector = [0.9, 0.1, 0.0, 0.0]
         mock_point.payload = {"text": "test fact", "importance": 0.8, "created_at": now, "access_count": 5}
-        core._qdrant.search = AsyncMock(return_value=[mock_point])
+        core._qdrant.query_points = AsyncMock(return_value=MagicMock(points=[mock_point]))
 
         core.embed = AsyncMock(return_value=[0.9, 0.1, 0.0, 0.0])
 
@@ -902,7 +902,7 @@ class TestQdrantFailures:
     async def test_search_when_qdrant_down(self):
         """search() should return empty list when Qdrant raises."""
         core = TestMemoryCore()._make_core()
-        core._qdrant.search = AsyncMock(side_effect=ConnectionError("Connection refused"))
+        core._qdrant.query_points = AsyncMock(side_effect=ConnectionError("Connection refused"))
         core._initialized = True
 
         # search() doesn't catch — it propagates. MemoryCore.search should let it bubble.
