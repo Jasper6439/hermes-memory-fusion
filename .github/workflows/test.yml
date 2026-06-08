@@ -45,12 +45,6 @@ jobs:
         image: qdrant/qdrant:v1.12.1
         ports:
           - 6333:6333
-        options: >-
-          --health-cmd "wget -qO- http://localhost:6333/readyz || exit 1"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 15
-          --health-start-period 10s
 
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +58,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+
+      - name: Wait for Qdrant
+        run: |
+          for i in $(seq 1 30); do
+            if python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:6333/readyz')" 2>/dev/null; then
+              echo "Qdrant ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Qdrant not ready after 30s"
+          exit 1
 
       - name: Run integration tests
         env:
@@ -80,12 +86,6 @@ jobs:
         image: qdrant/qdrant:v1.12.1
         ports:
           - 6333:6333
-        options: >-
-          --health-cmd "wget -qO- http://localhost:6333/readyz || exit 1"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 15
-          --health-start-period 10s
 
     steps:
       - uses: actions/checkout@v4
@@ -99,6 +99,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+
+      - name: Wait for Qdrant
+        run: |
+          for i in $(seq 1 30); do
+            if python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:6333/readyz')" 2>/dev/null; then
+              echo "Qdrant ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Qdrant not ready after 30s"
+          exit 1
 
       - name: Run benchmarks
         env:
