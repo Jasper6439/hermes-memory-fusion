@@ -1,205 +1,333 @@
-"""Memory Core — Unified memory system combining Write + Read pipelines.
+"""Memory Core — Unified Qdrant backend.
 
-Ties together:
-- Qdrant vector store for persistence
-- WritePipeline for auto-distillation (Hy-Memory style)
-- ReadPipeline for dialectic reasoning (Honcho style)
+Provides two high-level APIs:
+- remember(): Write raw text → distill → dedup → store
+- recall(): Query → multi-signal ranking → dialectic synthesis → answer
+
+Internal APIs:
+- hybrid_search(): Low-level Qdrant search with hybrid modes
+- get_facts_by_ids(): Batch fetch by fact IDs
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Optional, Literal
 
-from openai import OpenAI
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams, Filter, FieldCondition, MatchValue
+from openai import AsyncOpenAI
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 from hy_memory_fusion.config import FusionConfig
 from hy_memory_fusion.write_pipeline import WritePipeline, ExtractedFact
-from hy_memory_fusion.read_pipeline import ReadPipeline, SearchResult, DialecticResponse
+from hy_memory_fusion.read_pipeline import ReadPipeline, RankedFact
 
 logger = logging.getLogger(__name__)
 
 
 class MemoryCore:
-    """Unified memory system: auto-distill on write, dialectic reasoning on read.
+    """Unified memory backend combining Write and Read pipelines."""
 
-    Usage:
-        config = FusionConfig.from_env(".env")
-        core = MemoryCore(config)
+    def __init__(
+        self,
+        config: Optional[FusionConfig] = None,
+        qdrant_client: Optional[AsyncQdrantClient] = None,
+        llm_client: Optional[AsyncOpenAI] = None,
+        embed_client: Optional[AsyncOpenAI] = None,
+        reader_client: Optional[AsyncOpenAI] = None,
+        writer_client: Optional[AsyncOpenAI] = None,
+    ):
+        self.config = config or FusionConfig.from_env()
 
-        # Write: auto-distill conversation into structured facts
-        facts = await core.remember("Ulysses prefers dark mode UIs")
-
-        # Read: search + dialectic reasoning
-        answer = await core.recall("What UI preferences does the user have?")
-    """
-
-    def __init__(self, config: FusionConfig):
-        self.config = config
-
-        # LLM clients
-        self._llm = OpenAI(
-            api_key=config.llm.api_key,
-            base_url=config.llm.base_url or None,
+        # Shared embedding client
+        self._embed_client = embed_client or AsyncOpenAI(
+            base_url=self.config.embedder.base_url,
+            api_key=self.config.embedder.api_key,
+            timeout=self.config.embedder.timeout,
         )
-        self._embed = OpenAI(
-            api_key=config.embedder.api_key,
-            base_url=config.embedder.base_url,
+
+        # Writer LLM client (SVO extraction)
+        self._writer_client = writer_client or AsyncOpenAI(
+            base_url=self.config.writer.base_url,
+            api_key=self.config.writer.api_key,
+            timeout=self.config.writer.timeout,
         )
+
+        # Reader LLM client (synthesis)
+        self._reader_client = reader_client or AsyncOpenAI(
+            base_url=self.config.reader.base_url,
+            api_key=self.config.reader.api_key,
+            timeout=self.config.reader.timeout,
+        )
+
+        # Generic LLM client (for backward compat)
+        self._llm_client = llm_client or self._writer_client
+
+        # Qdrant client
+        self._qdrant = qdrant_client or AsyncQdrantClient(url=self.config.qdrant.url)
+        self._collection = self.config.qdrant.collection
 
         # Pipelines
-        self._writer = WritePipeline(config, self._llm, self._embed)
-        self._reader = ReadPipeline(config, self._llm)
+        self._writer = WritePipeline(
+            config=self.config,
+            llm_client=self._writer_client,
+            embed_client=self._embed_client,
+        )
+        self._reader = ReadPipeline(
+            config=self.config,
+            llm_client=self._reader_client,
+            embed_client=self._embed_client,
+        )
 
-        # Vector store
-        self._qdrant: QdrantClient | None = None
-        self._collection = config.vector_store.collection_name
+        self._initialized = False
 
-    def connect(self) -> None:
-        """Connect to Qdrant and ensure collection exists."""
-        kwargs: dict[str, Any] = {}
-        if self.config.vector_store.url:
-            kwargs["url"] = self.config.vector_store.url
-        if self.config.vector_store.api_key:
-            kwargs["api_key"] = self.config.vector_store.api_key
+    async def initialize(self) -> None:
+        """Create Qdrant collection if not exists."""
+        collections = await self._qdrant.get_collections()
+        names = [c.name for c in collections.collections]
 
-        self._qdrant = QdrantClient(**kwargs)
-
-        # Ensure collection exists
-        collections = [c.name for c in self._qdrant.get_collections().collections]
-        if self._collection not in collections:
-            self._qdrant.create_collection(
+        if self._collection not in names:
+            await self._qdrant.create_collection(
                 collection_name=self._collection,
                 vectors_config=VectorParams(
-                    size=self.config.vector_store.embedding_dims,
+                    size=self.config.qdrant.vector_dim,
                     distance=Distance.COSINE,
                 ),
             )
-            logger.info(f"Created collection: {self._collection}")
-        else:
-            logger.info(f"Using existing collection: {self._collection}")
+            logger.info("Created collection: %s", self._collection)
 
-    def close(self) -> None:
-        """Close connections."""
-        if self._qdrant:
-            self._qdrant.close()
+        self._initialized = True
 
-    # ── Write API ────────────────────────────────────────────────
+    async def embed(self, text: str) -> list[float]:
+        """Shared embedding method — public API for external callers."""
+        return await self._writer.embed(text)
 
-    async def remember(self, text: str, user_id: str = "default") -> list[ExtractedFact]:
-        """Ingest text → extract SVO facts → store in Qdrant.
+    async def remember(self, text: str, user_id: str = "default") -> list[dict[str, Any]]:
+        """Ingest raw text → distill → dedup → store → return stored facts.
 
-        This is the main write API. It:
-        1. Extracts atomic facts (SVO triplets) via LLM
-        2. Embeds each fact
-        3. Stores in Qdrant with metadata
-
-        Returns the list of extracted facts.
+        Fetches existing facts from Qdrant for dedup before calling writer.ingest().
         """
-        self._ensure_connected()
+        if not self._initialized:
+            await self.initialize()
 
-        # Extract + embed
-        facts = await self._writer.ingest(text, user_id)
+        # Fetch existing facts for dedup
+        existing_facts = []
+        if self.config.distillation.enabled:
+            try:
+                # Get a broad set of existing facts for dedup
+                all_points = await self._qdrant.scroll(
+                    collection_name=self._collection,
+                    limit=200,
+                    with_payload=True,
+                    with_vectors=True,
+                )
+                for point in all_points[0]:
+                    payload = point.payload or {}
+                    payload["embedding"] = point.vector
+                    existing_facts.append(payload)
+            except Exception as e:
+                logger.debug("Could not fetch existing facts for dedup: %s", e)
+
+        # Distill + dedup
+        facts = await self._writer.ingest(text, user_id=user_id, existing_facts=existing_facts)
+
+        # Filter by importance threshold
+        facts = [f for f in facts if f.importance >= self.config.distillation.importance_threshold]
+
+        if not facts:
+            logger.info("No facts above importance threshold")
+            return []
 
         # Store in Qdrant
         points = []
         for fact in facts:
             if not fact.embedding:
-                logger.warning(f"Skipping fact {fact.fact_id}: no embedding")
                 continue
+            payload = fact.to_dict()
+            payload["user_id"] = user_id
+            payload["access_count"] = 0
             points.append(
                 PointStruct(
                     id=fact.fact_id,
                     vector=fact.embedding,
-                    payload={
-                        **fact.to_dict(),
-                        "user_id": user_id,
-                    },
+                    payload=payload,
                 )
             )
 
         if points:
-            self._qdrant.upsert(collection_name=self._collection, points=points)
-            logger.info(f"Stored {len(points)} facts for user={user_id}")
+            await self._qdrant.upsert(
+                collection_name=self._collection,
+                points=points,
+            )
+            logger.info("Stored %d facts for user %s", len(points), user_id)
 
-        return facts
-
-    # ── Read API ─────────────────────────────────────────────────
+        return [f.to_dict() for f in facts]
 
     async def recall(
         self,
         query: str,
         user_id: str = "default",
-        depth: str | None = None,
-    ) -> DialecticResponse:
-        """Search memories + dialectic reasoning.
+        reasoning_level: str = "low",
+    ) -> dict[str, Any]:
+        """Query → multi-signal ranking → dialectic synthesis → answer.
 
-        This is the main read API. It:
-        1. Embeds the query
-        2. Searches Qdrant for relevant facts
-        3. Runs dialectic reasoning (multi-level LLM synthesis)
-
-        Returns a DialecticResponse with answer, confidence, citations.
+        Uses MemoryCore.embed() for query embedding (not writer._embed).
         """
-        self._ensure_connected()
+        if not self._initialized:
+            await self.initialize()
 
-        # Embed query
-        query_embedding = await self._writer._embed(query)
-        if not query_embedding:
-            return DialecticResponse(
-                answer="Failed to embed query.",
-                depth="error",
-                evidence_count=0,
-                confidence=0.0,
-                contradictions=[],
-                citations=[],
-            )
+        # Search
+        facts = await self._reader.search(query, self, user_id=user_id)
 
-        # Search Qdrant
-        search_results = self._qdrant.search(
+        # Synthesize
+        result = await self._reader.synthesize(query, facts, reasoning_level)
+        result["facts"] = [f.to_dict() for f in facts]
+        return result
+
+    # ── Vector store interface (used by ReadPipeline.search) ──────────────
+
+    async def search(
+        self,
+        query_embedding: list[float],
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Search Qdrant by vector similarity.
+
+        This is the vector_store interface that ReadPipeline.search() calls.
+        """
+        results = await self._qdrant.search(
             collection_name=self._collection,
             query_vector=query_embedding,
-            limit=self.config.recall.top_k,
-            query_filter=Filter(
-                must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
-            ),
-            score_threshold=self.config.recall.min_score,
+            limit=limit,
+            with_payload=True,
+            with_vectors=True,
         )
 
-        evidence = [
-            SearchResult(
-                text=hit.payload.get("text", ""),
-                score=hit.score,
-                fact_id=hit.id,
-                metadata=hit.payload,
-            )
-            for hit in search_results
+        return [
+            {
+                "fact_id": point.id,
+                "text": point.payload.get("text", ""),
+                "score": point.score,
+                "embedding": point.vector,
+                **{k: v for k, v in (point.payload or {}).items() if k != "text"},
+            }
+            for point in results
         ]
 
-        # Dialectic reasoning
-        return await self._reader.search_and_reason(query, evidence, depth)
+    async def update_access(self, fact_ids: list[str]) -> None:
+        """Increment access counter for retrieved facts."""
+        for fid in fact_ids:
+            try:
+                # Qdrant doesn't have atomic increment, use set_payload with read-modify-write
+                points = await self._qdrant.retrieve(
+                    collection_name=self._collection,
+                    ids=[fid],
+                    with_payload=True,
+                )
+                if points:
+                    current = points[0].payload.get("access_count", 0)
+                    await self._qdrant.set_payload(
+                        collection_name=self._collection,
+                        payload={"access_count": current + 1},
+                        points=[fid],
+                    )
+            except Exception as e:
+                logger.debug("Access update failed for %s: %s", fid, e)
 
-    # ── Utilities ────────────────────────────────────────────────
+    # ── Low-level hybrid search ──────────────────────────────────────────
 
-    async def list_facts(self, user_id: str = "default", limit: int = 50) -> list[dict]:
-        """List all stored facts for a user."""
-        self._ensure_connected()
-        results = self._qdrant.scroll(
+    async def hybrid_search(
+        self,
+        query: str,
+        mode: Literal["semantic", "hybrid", "fusion"] = "hybrid",
+        limit: int = 10,
+        filters: Optional[dict[str, Any]] = None,
+        user_id: str = "default",
+    ) -> list[dict[str, Any]]:
+        """Low-level search with mode selection.
+
+        Modes:
+        - semantic: Pure vector similarity
+        - hybrid: Vector + metadata filters
+        - fusion: Multi-query fusion (planned)
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        # Get query embedding
+        query_embedding = await self.embed(query)
+        if not query_embedding:
+            return []
+
+        # Build filter
+        qdrant_filter = None
+        if filters:
+            conditions = []
+            for key, value in filters.items():
+                conditions.append(FieldCondition(key=key, match=MatchValue(value=value)))
+            if user_id:
+                conditions.append(FieldCondition(key="user_id", match=MatchValue(value=user_id)))
+            qdrant_filter = Filter(must=conditions)
+        elif user_id:
+            qdrant_filter = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
+
+        # Search
+        results = await self._qdrant.search(
             collection_name=self._collection,
-            scroll_filter=Filter(
-                must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
-            ),
+            query_vector=query_embedding,
             limit=limit,
+            query_filter=qdrant_filter,
+            with_payload=True,
         )
-        return [point.payload for point in results[0]]
 
-    async def delete_fact(self, fact_id: str) -> None:
-        """Delete a specific fact."""
-        self._ensure_connected()
-        self._qdrant.delete(collection_name=self._collection, points_selector=[fact_id])
+        if mode == "semantic":
+            return [
+                {
+                    "fact_id": point.id,
+                    "text": point.payload.get("text", ""),
+                    "score": point.score,
+                    **{k: v for k, v in (point.payload or {}).items() if k != "text"},
+                }
+                for point in results
+            ]
 
-    def _ensure_connected(self) -> None:
-        if not self._qdrant:
-            raise RuntimeError("Not connected. Call connect() first.")
+        # hybrid / fusion: use full read pipeline ranking
+        raw = [
+            {
+                "fact_id": point.id,
+                "text": point.payload.get("text", ""),
+                "score": point.score,
+                "embedding": point.payload.get("embedding", []),
+                **{k: v for k, v in (point.payload or {}).items() if k not in ("text", "embedding")},
+            }
+            for point in results
+        ]
+        ranked = self._reader._rank(query_embedding, raw)
+        return [r.to_dict() for r in ranked[:limit]]
+
+    # ── Batch operations ─────────────────────────────────────────────────
+
+    async def get_facts_by_ids(self, fact_ids: list[str]) -> list[dict[str, Any]]:
+        """Batch fetch facts by IDs."""
+        if not fact_ids:
+            return []
+
+        results = await self._qdrant.retrieve(
+            collection_name=self._collection,
+            ids=fact_ids,
+            with_payload=True,
+        )
+
+        return [
+            {"fact_id": point.id, **(point.payload or {})}
+            for point in results
+        ]

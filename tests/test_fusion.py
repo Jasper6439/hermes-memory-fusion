@@ -1,197 +1,510 @@
-"""Tests for hermes-memory-fusion.
+"""Tests for hermes-memory-fusion: Write Pipeline, Read Pipeline, Memory Core.
 
-Tests use mock OpenAI/Qdrant clients to avoid real API calls.
+All tests use mock clients — no live LLM/Qdrant needed.
+Run: pytest tests/ -v
 """
 
-import json
+from __future__ import annotations
+
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import datetime, timezone, timedelta
 
-from hy_memory_fusion.config import FusionConfig, VectorStoreConfig, EmbedderConfig, LLMConfig
-from hy_memory_fusion.write_pipeline import WritePipeline, ExtractedFact
-from hy_memory_fusion.read_pipeline import ReadPipeline, SearchResult, DialecticResponse
+from hy_memory_fusion.config import (
+    FusionConfig,
+    LLMConfig,
+    EmbedderConfig,
+    QdrantConfig,
+    DistillationConfig,
+    RecallConfig,
+    PipelineConfig,
+)
+from hy_memory_fusion.write_pipeline import WritePipeline, ExtractedFact, _cosine_similarity
+from hy_memory_fusion.read_pipeline import ReadPipeline, RankedFact
+from hy_memory_fusion.memory_core import MemoryCore
 
 
-# ── Config Tests ─────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────
 
 
-class TestConfig:
-    def test_default_config(self):
+def make_config() -> FusionConfig:
+    return FusionConfig(
+        llm=LLMConfig(base_url="http://test", api_key="test", model="test-model"),
+        embedder=EmbedderConfig(base_url="http://test", api_key="test", model="test-embed", batch_size=2),
+        qdrant=QdrantConfig(url="http://test:6333", collection="test_fusion", vector_dim=4),
+        distillation=DistillationConfig(enabled=True, importance_threshold=0.3, dedup_threshold=0.92),
+        recall=RecallConfig(
+            max_results=5,
+            min_score=0.1,
+            semantic_weight=0.6,
+            recency_weight=0.15,
+            importance_weight=0.2,
+            access_weight=0.05,
+        ),
+        pipeline=PipelineConfig(timeout=5.0, max_retries=1, retry_delay=0.01),
+        reader=LLMConfig(base_url="http://test", api_key="test", model="test-reader"),
+        writer=LLMConfig(base_url="http://test", api_key="test", model="test-writer"),
+    )
+
+
+def mock_embed_client(responses: list[list[float]] | None = None):
+    """Create a mock AsyncOpenAI embed client."""
+    client = AsyncMock()
+    call_count = [0]
+
+    def side_effect(**kwargs):
+        mock_resp = MagicMock()
+        inp = kwargs.get("input", "")
+        if isinstance(inp, list):
+            # Batch embed
+            mock_resp.data = [MagicMock(embedding=responses[i % len(responses)] if responses else [0.1, 0.2, 0.3, 0.4]) for i in range(len(inp))]
+        else:
+            emb = responses[call_count[0] % len(responses)] if responses else [0.1, 0.2, 0.3, 0.4]
+            mock_resp.data = [MagicMock(embedding=emb)]
+            call_count[0] += 1
+        return mock_resp
+
+    client.embeddings.create = AsyncMock(side_effect=side_effect)
+    return client
+
+
+def mock_llm_client(response_content: str):
+    """Create a mock AsyncOpenAI LLM client."""
+    client = AsyncMock()
+    mock_message = MagicMock()
+    mock_message.content = response_content
+    mock_choice = MagicMock()
+    mock_choice.message = mock_message
+    mock_resp = MagicMock()
+    mock_resp.choices = [mock_choice]
+    client.chat.completions.create = AsyncMock(return_value=mock_resp)
+    return client
+
+
+# ── Config Tests ─────────────────────────────────────────────────────────
+
+
+class TestFusionConfig:
+    def test_default_values(self):
         cfg = FusionConfig()
-        assert cfg.vector_store.embedding_dims == 1024
-        assert cfg.distillation.enabled is True
-        assert cfg.dialectic.depth == "medium"
-        assert cfg.recall.top_k == 10
+        assert cfg.llm.model == "nousresearch/hermes-3-llama-3.1-405b"
+        assert cfg.qdrant.vector_dim == 1024
+        assert cfg.distillation.dedup_threshold == 0.92
+        assert cfg.recall.semantic_weight == 0.6
+        assert cfg.recall.recency_weight == 0.15
+        assert cfg.recall.importance_weight == 0.2
+        assert cfg.recall.access_weight == 0.05
 
-    def test_custom_config(self):
-        cfg = FusionConfig(
-            vector_store=VectorStoreConfig(url="http://test:6333", collection_name="test_col"),
-            dialectic={"depth": "high"},  # type: ignore
-        )
-        assert cfg.vector_store.url == "http://test:6333"
-        assert cfg.vector_store.collection_name == "test_col"
+    def test_from_env(self, monkeypatch):
+        monkeypatch.setenv("FUSION_LLM_MODEL", "env-model")
+        monkeypatch.setenv("FUSION_QDRANT_URL", "http://env:6333")
+        monkeypatch.setenv("FUSION_DISTILLATION_ENABLED", "false")
+        monkeypatch.setenv("FUSION_DEDUP_THRESHOLD", "0.85")
+        monkeypatch.setenv("FUSION_READER_MODEL", "env-reader")
+        monkeypatch.setenv("FUSION_WRITER_MODEL", "env-writer")
+        monkeypatch.setenv("FUSION_EMBEDDER_MODEL", "env-embed")
+        monkeypatch.setenv("FUSION_PIPELINE_TIMEOUT", "60")
+        monkeypatch.setenv("FUSION_PIPELINE_MAX_RETRIES", "3")
+        monkeypatch.setenv("FUSION_RECALL_SEMANTIC_WEIGHT", "0.7")
+
+        cfg = FusionConfig.from_env()
+        assert cfg.llm.model == "env-model"
+        assert cfg.qdrant.url == "http://env:6333"
+        assert cfg.distillation.enabled is False
+        assert cfg.distillation.dedup_threshold == 0.85
+        assert cfg.reader.model == "env-reader"
+        assert cfg.writer.model == "env-writer"
+        assert cfg.embedder.model == "env-embed"
+        assert cfg.pipeline.timeout == 60.0
+        assert cfg.pipeline.max_retries == 3
+        assert cfg.recall.semantic_weight == 0.7
 
 
-# ── ExtractedFact Tests ─────────────────────────────────────
+# ── Write Pipeline Tests ─────────────────────────────────────────────────
 
 
 class TestExtractedFact:
     def test_auto_fields(self):
-        fact = ExtractedFact(subject="Ulysses", relation="prefers", object="dark mode")
-        assert fact.text == "Ulysses prefers dark mode"
+        fact = ExtractedFact(subject="Alice", relation="likes", object="coffee")
+        assert fact.text == "Alice likes coffee"
         assert fact.fact_id.startswith("f_")
-        assert fact.created_at  # auto-generated
-
-    def test_deterministic_id(self):
-        f1 = ExtractedFact(subject="A", relation="is", object="B")
-        f2 = ExtractedFact(subject="A", relation="is", object="B")
-        assert f1.fact_id == f2.fact_id
+        assert fact.created_at  # auto-set
+        assert fact.importance == 0.5
 
     def test_to_dict(self):
-        fact = ExtractedFact(subject="X", relation="has", object="Y", importance=0.8)
+        fact = ExtractedFact(subject="Bob", relation="is", object="admin", importance=0.9)
         d = fact.to_dict()
-        assert d["subject"] == "X"
-        assert d["importance"] == 0.8
+        assert d["subject"] == "Bob"
+        assert d["importance"] == 0.9
         assert "fact_id" in d
         assert "created_at" in d
 
 
-# ── Write Pipeline Tests ────────────────────────────────────
-
-
 class TestWritePipeline:
-    def _make_pipeline(self, llm_response: str = "[]"):
-        cfg = FusionConfig()
-        mock_llm = MagicMock()
-        mock_embed = MagicMock()
-
-        # Mock LLM response
-        choice = MagicMock()
-        choice.message.content = llm_response
-        mock_llm.chat.completions.create.return_value = MagicMock(choices=[choice])
-
-        # Mock embedding response
-        emb_data = MagicMock()
-        emb_data.embedding = [0.1] * 1024
-        mock_embed.embeddings.create.return_value = MagicMock(data=[emb_data])
-
-        return WritePipeline(cfg, mock_llm, mock_embed)
-
     @pytest.mark.asyncio
-    async def test_extract_svo_empty(self):
-        pipeline = self._make_pipeline("[]")
-        facts = await pipeline._extract_svo("hello world")
-        # Empty SVO extraction returns empty list (no facts to extract from noise)
-        assert isinstance(facts, list)
+    async def test_ingest_bypass_disabled(self):
+        config = make_config()
+        config.distillation.enabled = False
+        writer = WritePipeline(config, mock_llm_client("[]"), mock_embed_client())
 
-    @pytest.mark.asyncio
-    async def test_extract_svo_valid(self):
-        svo_json = json.dumps([
-            {"subject": "Ulysses", "relation": "manages", "object": "OCI servers", "importance": 0.9, "category": "fact"},
-            {"subject": "Server", "relation": "runs on", "object": "ARM64 Ubuntu", "importance": 0.7, "category": "fact"},
-        ])
-        pipeline = self._make_pipeline(svo_json)
-        facts = await pipeline._extract_svo("Ulysses manages OCI servers running on ARM64 Ubuntu")
-        assert len(facts) == 2
-        assert facts[0].subject == "Ulysses"
-        assert facts[0].importance == 0.9
-
-    @pytest.mark.asyncio
-    async def test_ingest_disabled(self):
-        cfg = FusionConfig()
-        cfg.distillation.enabled = False
-        pipeline = self._make_pipeline()
-        pipeline.config = cfg
-        facts = await pipeline.ingest("test text")
+        facts = await writer.ingest("Test text")
         assert len(facts) == 1
-        assert facts[0].subject == "test text"
+        assert facts[0].subject == "Test text"
+        assert facts[0].relation == "is"
+        assert facts[0].embedding  # should have embedding
 
     @pytest.mark.asyncio
-    async def test_embed(self):
-        pipeline = self._make_pipeline()
-        vec = await pipeline._embed("test")
-        assert len(vec) == 1024
-        assert all(v == 0.1 for v in vec)
+    async def test_ingest_extracts_svo(self):
+        svo_response = json.dumps([
+            {"subject": "Alice", "relation": "likes", "object": "coffee", "importance": 0.7, "category": "preference"},
+            {"subject": "Bob", "relation": "is", "object": "admin", "importance": 0.9, "category": "identity"},
+        ])
+        config = make_config()
+        writer = WritePipeline(
+            config,
+            mock_llm_client(svo_response),
+            mock_embed_client([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]),
+        )
+
+        facts = await writer.ingest("Alice likes coffee. Bob is admin.")
+        assert len(facts) == 2
+        assert facts[0].subject == "Alice"
+        assert facts[0].importance == 0.7
+        assert facts[1].subject == "Bob"
+        assert facts[0].embedding == [0.1, 0.2, 0.3, 0.4]
+
+    @pytest.mark.asyncio
+    async def test_ingest_dedup_removes_similar(self):
+        svo_response = json.dumps([
+            {"subject": "Alice", "relation": "likes", "object": "coffee", "importance": 0.7},
+        ])
+        config = make_config()
+        # New fact and existing fact have same embedding → high similarity
+        writer = WritePipeline(
+            config,
+            mock_llm_client(svo_response),
+            mock_embed_client([[0.9, 0.1, 0.0, 0.0]]),
+        )
+
+        existing = [{"text": "Alice likes coffee", "embedding": [0.9, 0.1, 0.0, 0.0], "fact_id": "existing_1"}]
+        facts = await writer.ingest("Alice likes coffee", existing_facts=existing)
+        assert len(facts) == 0  # deduped
+
+    @pytest.mark.asyncio
+    async def test_ingest_dedup_keeps_different(self):
+        svo_response = json.dumps([
+            {"subject": "Bob", "relation": "runs", "object": "marathon", "importance": 0.6},
+        ])
+        config = make_config()
+        writer = WritePipeline(
+            config,
+            mock_llm_client(svo_response),
+            mock_embed_client([[0.0, 0.0, 0.9, 0.1]]),
+        )
+
+        existing = [{"text": "Alice likes coffee", "embedding": [0.9, 0.1, 0.0, 0.0], "fact_id": "existing_1"}]
+        facts = await writer.ingest("Bob runs marathon", existing_facts=existing)
+        assert len(facts) == 1  # not deduped (different embedding)
+
+    @pytest.mark.asyncio
+    async def test_ingest_filters_by_importance(self):
+        svo_response = json.dumps([
+            {"subject": "noise", "relation": "is", "object": "trivial", "importance": 0.1},
+        ])
+        config = make_config()
+        config.distillation.importance_threshold = 0.3
+        writer = WritePipeline(
+            config,
+            mock_llm_client(svo_response),
+            mock_embed_client(),
+        )
+
+        facts = await writer.ingest("some noise")
+        # Facts returned by pipeline, but memory_core would filter them
+        assert len(facts) == 1  # pipeline returns all; memory_core filters
+        assert facts[0].importance == 0.1
+
+    @pytest.mark.asyncio
+    async def test_ingest_handles_invalid_json(self):
+        config = make_config()
+        writer = WritePipeline(config, mock_llm_client("not json"), mock_embed_client())
+
+        facts = await writer.ingest("test text")
+        assert len(facts) == 1  # fallback to raw text
+        assert facts[0].relation == "states"
+
+    @pytest.mark.asyncio
+    async def test_embed_batch(self):
+        config = make_config()
+        config.embedder.batch_size = 2
+        writer = WritePipeline(
+            config,
+            mock_llm_client("[]"),
+            mock_embed_client([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8], [0.9, 0.8, 0.7, 0.6]]),
+        )
+
+        embeddings = await writer._embed_batch(["a", "b", "c"])
+        assert len(embeddings) == 3
+
+    @pytest.mark.asyncio
+    async def test_embed_public_method(self):
+        config = make_config()
+        writer = WritePipeline(config, mock_llm_client("[]"), mock_embed_client([[0.1, 0.2, 0.3, 0.4]]))
+
+        result = await writer.embed("test text")
+        assert result == [0.1, 0.2, 0.3, 0.4]
 
 
-# ── Read Pipeline Tests ─────────────────────────────────────
+class TestCosineSimilarity:
+    def test_identical(self):
+        assert _cosine_similarity([1, 0, 0], [1, 0, 0]) == pytest.approx(1.0)
+
+    def test_orthogonal(self):
+        assert _cosine_similarity([1, 0], [0, 1]) == pytest.approx(0.0)
+
+    def test_opposite(self):
+        assert _cosine_similarity([1, 0], [-1, 0]) == pytest.approx(-1.0)
+
+    def test_zero_vector(self):
+        assert _cosine_similarity([0, 0], [1, 0]) == 0.0
+
+    def test_different_lengths(self):
+        assert _cosine_similarity([1, 0], [1, 0, 0]) == 0.0
+
+
+# ── Read Pipeline Tests ──────────────────────────────────────────────────
+
+
+class TestRankedFact:
+    def test_to_dict(self):
+        fact = RankedFact(
+            fact_id="f1", text="test", score=0.85,
+            semantic_score=0.9, recency_score=0.8,
+            importance_score=0.7, access_score=0.6,
+        )
+        d = fact.to_dict()
+        assert d["score"] == 0.85
+        assert d["semantic_score"] == 0.9
 
 
 class TestReadPipeline:
-    def _make_pipeline(self, response_json: str | None = None):
-        cfg = FusionConfig()
-        mock_llm = MagicMock()
+    def _make_pipeline(self):
+        config = make_config()
+        return ReadPipeline(config, mock_llm_client("{}"), mock_embed_client())
 
-        if response_json is None:
-            response_json = json.dumps({
-                "answer": "Ulysses manages OCI servers in Tokyo.",
-                "confidence": 0.9,
-                "contradictions": [],
-                "citations": ["f_abc123"],
-            })
-
-        choice = MagicMock()
-        choice.message.content = response_json
-        mock_llm.chat.completions.create.return_value = MagicMock(choices=[choice])
-
-        return ReadPipeline(cfg, mock_llm)
-
-    @pytest.mark.asyncio
-    async def test_dialectic_basic(self):
+    def test_rank_applies_all_weights(self):
         pipeline = self._make_pipeline()
-        evidence = [
-            SearchResult(text="Ulysses manages OCI servers", score=0.95, fact_id="f_abc123"),
-            SearchResult(text="Server runs ARM64 Ubuntu", score=0.85, fact_id="f_def456"),
+        query_embedding = [1.0, 0.0, 0.0, 0.0]
+
+        now = datetime.now(timezone.utc)
+        raw = [
+            {
+                "fact_id": "recent_important",
+                "text": "recent and important",
+                "embedding": [1.0, 0.0, 0.0, 0.0],  # high semantic
+                "importance": 0.9,
+                "created_at": now.isoformat(),  # very recent
+                "access_count": 10,
+            },
+            {
+                "fact_id": "old_trivial",
+                "text": "old and trivial",
+                "embedding": [0.0, 1.0, 0.0, 0.0],  # low semantic
+                "importance": 0.1,
+                "created_at": (now - timedelta(days=365)).isoformat(),  # old
+                "access_count": 0,
+            },
         ]
-        result = await pipeline.search_and_reason("What does Ulysses manage?", evidence)
-        assert isinstance(result, DialecticResponse)
-        assert "OCI" in result.answer
-        assert result.confidence == 0.9
-        assert result.evidence_count == 2
+
+        ranked = pipeline._rank(query_embedding, raw)
+        assert len(ranked) == 2
+        assert ranked[0].fact_id == "recent_important"
+        assert ranked[0].score > ranked[1].score
+
+        # Verify all four signals are computed
+        assert ranked[0].semantic_score > 0.9  # exact match
+        assert ranked[0].recency_score > 0.9   # just created
+        assert ranked[0].importance_score == 0.9
+        assert ranked[0].access_score > 0.4     # 10 accesses
+
+        assert ranked[1].semantic_score < 0.1   # orthogonal
+        assert ranked[1].recency_score < 0.1    # 365 days old
+        assert ranked[1].importance_score == 0.1
+
+    def test_rank_respects_weights(self):
+        pipeline = self._make_pipeline()
+        # Override weights: only importance matters
+        pipeline.config.recall.semantic_weight = 0.0
+        pipeline.config.recall.recency_weight = 0.0
+        pipeline.config.recall.importance_weight = 1.0
+        pipeline.config.recall.access_weight = 0.0
+
+        query_embedding = [1.0, 0.0, 0.0, 0.0]
+        raw = [
+            {"fact_id": "low_imp", "text": "low", "embedding": [1.0, 0.0, 0.0, 0.0], "importance": 0.1, "created_at": "", "access_count": 0},
+            {"fact_id": "high_imp", "text": "high", "embedding": [0.0, 1.0, 0.0, 0.0], "importance": 0.9, "created_at": "", "access_count": 0},
+        ]
+
+        ranked = pipeline._rank(query_embedding, raw)
+        # Even though "low_imp" has better semantic match, importance_weight=1.0 dominates
+        assert ranked[0].fact_id == "high_imp"
+
+    def test_rank_empty(self):
+        pipeline = self._make_pipeline()
+        ranked = pipeline._rank([1, 0, 0, 0], [])
+        assert ranked == []
 
     @pytest.mark.asyncio
-    async def test_dialectic_bypass(self):
-        cfg = FusionConfig()
-        cfg.dialectic.enabled = False
-        pipeline = self._make_pipeline()
-        pipeline.config = cfg
-        evidence = [SearchResult(text="test fact", score=0.8, fact_id="f_001")]
-        result = await pipeline.search_and_reason("query", evidence)
-        assert result.depth == "bypass"
-        assert result.answer == "test fact"
+    async def test_synthesize_returns_answer(self):
+        synthesis_response = json.dumps({
+            "answer": "Alice likes coffee",
+            "confidence": 0.85,
+            "sources": ["f1"],
+            "reasoning": "Direct fact match",
+        })
+        pipeline = ReadPipeline(
+            make_config(),
+            mock_llm_client(synthesis_response),
+            mock_embed_client(),
+        )
+
+        facts = [RankedFact(fact_id="f1", text="Alice likes coffee", score=0.9)]
+        result = await pipeline.synthesize("What does Alice like?", facts, "low")
+        assert result["answer"] == "Alice likes coffee"
+        assert result["confidence"] == 0.85
 
     @pytest.mark.asyncio
-    async def test_dialectic_no_evidence(self):
+    async def test_synthesize_empty_facts(self):
         pipeline = self._make_pipeline()
-        result = await pipeline.search_and_reason("query", [])
-        assert result.depth == "bypass"
-        assert "No relevant" in result.answer
+        result = await pipeline.synthesize("test", [], "low")
+        assert "No relevant" in result["answer"]
+
+
+# ── Memory Core Tests ────────────────────────────────────────────────────
+
+
+class TestMemoryCore:
+    def _make_core(self, llm_response="[]", embed_responses=None):
+        config = make_config()
+        embed_resp = embed_responses or [[0.1, 0.2, 0.3, 0.4]]
+
+        # Mock Qdrant client
+        mock_qdrant = AsyncMock()
+        mock_qdrant.get_collections = AsyncMock(return_value=MagicMock(collections=[]))
+        mock_qdrant.create_collection = AsyncMock()
+        mock_qdrant.search = AsyncMock(return_value=[])
+        mock_qdrant.scroll = AsyncMock(return_value=([], None))
+        mock_qdrant.upsert = AsyncMock()
+        mock_qdrant.retrieve = AsyncMock(return_value=[])
+        mock_qdrant.set_payload = AsyncMock()
+
+        core = MemoryCore(
+            config=config,
+            qdrant_client=mock_qdrant,
+            llm_client=mock_llm_client(llm_response),
+            embed_client=mock_embed_client(embed_resp),
+            reader_client=mock_llm_client("{}"),
+            writer_client=mock_llm_client(llm_response),
+        )
+        return core
 
     @pytest.mark.asyncio
-    async def test_depth_levels(self):
-        pipeline = self._make_pipeline()
-        evidence = [SearchResult(text="fact", score=0.9, fact_id="f_001")]
-        for depth in ["minimal", "low", "medium", "high", "max"]:
-            result = await pipeline.search_and_reason("query", evidence, depth=depth)
-            assert result.depth == depth
+    async def test_initialize_creates_collection(self):
+        core = self._make_core()
+        await core.initialize()
+        assert core._initialized
+        core._qdrant.create_collection.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_remember_stores_facts(self):
+        svo_response = json.dumps([
+            {"subject": "Alice", "relation": "likes", "object": "coffee", "importance": 0.7},
+        ])
+        core = self._make_core(llm_response=svo_response)
+        core.config.distillation.importance_threshold = 0.0
 
-# ── Fact Lifecycle Tests ────────────────────────────────────
+        result = await core.remember("Alice likes coffee")
+        assert len(result) == 1
+        assert result[0]["subject"] == "Alice"
+        core._qdrant.upsert.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_remember_fetches_existing_for_dedup(self):
+        svo_response = json.dumps([
+            {"subject": "test", "relation": "is", "object": "fact", "importance": 0.5},
+        ])
+        core = self._make_core(llm_response=svo_response)
+        core.config.distillation.importance_threshold = 0.0
 
-class TestFactLifecycle:
-    def test_fact_idempotent(self):
-        """Same text should produce same fact ID."""
-        f1 = ExtractedFact(subject="A", relation="is", object="B")
-        f2 = ExtractedFact(subject="A", relation="is", object="B")
-        assert f1.fact_id == f2.fact_id
+        await core.remember("test fact")
+        # Should have called scroll to fetch existing facts
+        core._qdrant.scroll.assert_called_once()
 
-    def test_fact_categories(self):
-        for cat in ["preference", "fact", "event", "identity", "intent"]:
-            f = ExtractedFact(subject="X", relation="is", object="Y", category=cat)
-            assert f.category == cat
+    @pytest.mark.asyncio
+    async def test_recall_calls_search_and_synthesize(self):
+        core = self._make_core()
+        core._reader.search = AsyncMock(return_value=[
+            RankedFact(fact_id="f1", text="test fact", score=0.9),
+        ])
+        core._reader.synthesize = AsyncMock(return_value={
+            "answer": "test answer",
+            "confidence": 0.8,
+            "sources": ["f1"],
+            "reasoning": "test",
+        })
 
-    def test_fact_importance_range(self):
-        for imp in [0.0, 0.3, 0.5, 0.8, 1.0]:
-            f = ExtractedFact(subject="X", relation="is", object="Y", importance=imp)
-            assert f.importance == imp
+        result = await core.remember("test")  # init
+        core._reader.search.reset_mock()
+        core._reader.synthesize.reset_mock()
+
+        result = await core.recall("What is test?")
+        assert "answer" in result
+        assert "facts" in result
+        core._reader.search.assert_called_once()
+        core._reader.synthesize.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_hybrid_search_semantic(self):
+        core = self._make_core()
+        mock_point = MagicMock()
+        mock_point.id = "f1"
+        mock_point.score = 0.95
+        mock_point.payload = {"text": "test", "importance": 0.8}
+        core._qdrant.search = AsyncMock(return_value=[mock_point])
+
+        results = await core.hybrid_search("test", mode="semantic")
+        assert len(results) == 1
+        assert results[0]["fact_id"] == "f1"
+        assert results[0]["score"] == 0.95
+
+    @pytest.mark.asyncio
+    async def test_embed_uses_shared_client(self):
+        core = self._make_core()
+        result = await core.embed("test text")
+        assert result == [0.1, 0.2, 0.3, 0.4]
+
+    @pytest.mark.asyncio
+    async def test_get_facts_by_ids(self):
+        core = self._make_core()
+        mock_point = MagicMock()
+        mock_point.id = "f1"
+        mock_point.payload = {"text": "test"}
+        core._qdrant.retrieve = AsyncMock(return_value=[mock_point])
+
+        results = await core.get_facts_by_ids(["f1"])
+        assert len(results) == 1
+        assert results[0]["fact_id"] == "f1"
+
+    @pytest.mark.asyncio
+    async def test_update_access_increments(self):
+        core = self._make_core()
+        mock_point = MagicMock()
+        mock_point.payload = {"access_count": 3}
+        core._qdrant.retrieve = AsyncMock(return_value=[mock_point])
+
+        await core.update_access(["f1"])
+        core._qdrant.set_payload.assert_called_once()
+        call_args = core._qdrant.set_payload.call_args
+        assert call_args.kwargs["payload"]["access_count"] == 4

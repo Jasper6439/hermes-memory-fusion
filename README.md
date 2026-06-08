@@ -1,98 +1,102 @@
-# Hermes Memory Fusion
+# hermes-memory-fusion
 
-**Hy-Memory auto-distillation + Honcho dialectic reasoning = best of both worlds.**
+A hybrid memory system combining **Hy-Memory's write pipeline** (SVO extraction + deduplication) with **Honcho's read pipeline** (multi-signal ranking + dialectic reasoning), unified on a single Qdrant backend.
 
 ## Architecture
 
 ```
-Write (Hy-Memory style)              Read (Honcho style)
-┌─────────────────────┐              ┌──────────────────────┐
-│ Raw conversation    │              │ User query           │
-│        ↓            │              │        ↓             │
-│ LLM: SVO extraction │              │ Embed query          │
-│        ↓            │              │        ↓             │
-│ Embed each fact     │              │ Qdrant vector search │
-│        ↓            │              │        ↓             │
-│ Store in Qdrant     │              │ LLM: Dialectic       │
-│                     │              │ reasoning (5 levels) │
-└─────────────────────┘              │        ↓             │
-                                     │ Answer + citations   │
-         ┌───────────┐               └──────────────────────┘
-         │  Qdrant   │
-         │  Cloud    │←──────── both read/write
-         └───────────┘
+┌─────────────────────────────────────────────┐
+│              MemoryCore                      │
+│  remember() ←────→ recall()                 │
+│       │                   │                  │
+│  ┌────▼────┐         ┌───▼────┐             │
+│  │  Write   │         │  Read   │             │
+│  │ Pipeline │         │ Pipeline│             │
+│  │(Hy-Memory)│        │(Honcho) │             │
+│  └────┬────┘         └───┬────┘             │
+│       │                   │                  │
+│  ┌────▼───────────────────▼────┐             │
+│  │        Qdrant Vector DB      │             │
+│  └──────────────────────────────┘             │
+└─────────────────────────────────────────────┘
 ```
 
-## What's borrowed from where
+## Write Pipeline (from Hy-Memory)
 
-| Feature | Source | Description |
-|---------|--------|-------------|
-| SVO extraction | Hy-Memory | LLM extracts Subject-Verb-Object triplets |
-| Auto-distillation | Hy-Memory | Async fact extraction from conversations |
-| Deduplication | Hy-Memory | Cosine similarity threshold for duplicates |
-| Dialectic reasoning | Honcho | Multi-level LLM synthesis (minimal→max) |
-| Evidence citations | Honcho | Answer cites which facts support each claim |
-| Contradiction detection | Honcho | Flags conflicting evidence |
+- **SVO Extraction**: LLM extracts Subject-Verb-Object triplets from raw text
+- **Batch Embedding**: Single API call for all extracted facts
+- **Semantic Deduplication**: Cosine similarity threshold (default 0.92) removes duplicates against existing memories
+- **Importance Filtering**: Only stores facts above configurable threshold (default 0.3)
+
+## Read Pipeline (from Honcho)
+
+- **Multi-Signal Ranking**: Four weighted signals:
+  - Semantic similarity (60%) — cosine similarity of query vs fact embeddings
+  - Recency (15%) — exponential decay with 30-day half-life
+  - Importance (20%) — fact's self-assigned importance score
+  - Access frequency (5%) — logarithmic saturation at ~10 accesses
+- **Dialectic Reasoning**: 5 levels (minimal → max) with appropriate prompt depth
+- **Access Counter Updates**: Fire-and-forget increment on retrieval
 
 ## Quick Start
 
+```bash
+pip install -e ".[dev]"
+```
+
 ```python
-from hy_memory_fusion import MemoryCore, FusionConfig
+from hy_memory_fusion import MemoryCore
 
-config = FusionConfig.from_env(".env")
-core = MemoryCore(config)
-core.connect()
+core = MemoryCore()
+await core.initialize()
 
-# Write: auto-distill into structured facts
-facts = await core.remember("Ulysses prefers dark mode. He manages OCI servers in Tokyo.")
-# → Extracts 2 SVO facts, embeds, stores in Qdrant
+# Write
+await core.remember("Alice likes coffee with oat milk")
 
-# Read: search + dialectic reasoning
-answer = await core.recall("What does the user prefer?", depth="medium")
-# → Searches Qdrant, runs multi-level LLM synthesis
-print(answer.answer)       # "Ulysses prefers dark mode UIs."
-print(answer.confidence)   # 0.9
-print(answer.citations)    # ["f_a1b2c3"]
+# Read
+result = await core.recall("What does Alice like to drink?")
+print(result["answer"])
 ```
 
 ## Configuration
 
-Create a `.env` file:
+All config via environment variables:
 
-```env
-# Vector Store (Qdrant)
-MEMORY_VECTOR_STORE_URL=https://your-qdrant-url
-MEMORY_VECTOR_STORE_API_KEY=your-key
-MEMORY_VECTOR_STORE_COLLECTION_NAME=hermes_memory
-MEMORY_VECTOR_STORE_EMBEDDING_DIMS=1024
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FUSION_LLM_BASE_URL` | openrouter | Main LLM endpoint |
+| `FUSION_LLM_MODEL` | hermes-3-405b | Main LLM model |
+| `FUSION_WRITER_MODEL` | same as LLM | SVO extraction model |
+| `FUSION_READER_MODEL` | local llama-server | Synthesis model |
+| `FUSION_EMBEDDER_MODEL` | mxbai-embed-large | Embedding model |
+| `FUSION_QDRANT_URL` | localhost:6333 | Qdrant endpoint |
+| `FUSION_DEDUP_THRESHOLD` | 0.92 | Dedup similarity threshold |
+| `FUSION_PIPELINE_MAX_RETRIES` | 2 | LLM call retries |
+| `FUSION_PIPELINE_TIMEOUT` | 30.0 | LLM call timeout (seconds) |
+| `FUSION_RECALL_SEMANTIC_WEIGHT` | 0.6 | Semantic signal weight |
+| `FUSION_RECALL_RECENCY_WEIGHT` | 0.15 | Recency signal weight |
+| `FUSION_RECALL_IMPORTANCE_WEIGHT` | 0.2 | Importance signal weight |
+| `FUSION_RECALL_ACCESS_WEIGHT` | 0.05 | Access frequency weight |
 
-# Embedder (Ollama / OpenAI-compatible)
-MEMORY_EMBEDDER_MODEL=mxbai-embed-large
-MEMORY_EMBEDDER_BASE_URL=http://localhost:11434/v1
-MEMORY_EMBEDDER_API_KEY=ollama
-
-# LLM (Gemini / OpenAI-compatible)
-MEMORY_LLM_MODEL=gemini-2.5-flash
-MEMORY_LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
-MEMORY_LLM_API_KEY=your-gemini-key
-```
-
-## Dialectic Depth Levels
-
-| Level | Use case | Token cost |
-|-------|----------|-----------|
-| `minimal` | Quick lookup, 1-2 sentences | Low |
-| `low` | Simple Q&A with citations | Low |
-| `medium` | Comprehensive analysis | Medium |
-| `high` | Multi-perspective deep analysis | High |
-| `max` | Exhaustive audit-level report | Very high |
-
-## Development
+## Testing
 
 ```bash
-pip install -e ".[dev]"
-pytest -v --cov=hy_memory_fusion
+# Unit tests (no live services needed)
+pytest tests/ -v
+
+# With coverage
+pytest tests/ -v --cov=hy_memory_fusion --cov-report=term-missing
 ```
+
+## Three-Layer Memory Architecture
+
+This project implements Layer 3 (Qdrant) of the Hermes memory stack:
+
+| Layer | Component | Purpose |
+|-------|-----------|---------|
+| L1 | MEMORY.md | Hot cache (<50% capacity) |
+| L2 | Honcho | Dialectic reasoning + session context |
+| L3 | **This project** | Structured facts in Qdrant |
 
 ## License
 
