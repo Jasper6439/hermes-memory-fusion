@@ -19,6 +19,7 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 from hy_memory_fusion.config import FusionConfig
+from hy_memory_fusion._utils import retry
 
 logger = logging.getLogger(__name__)
 
@@ -78,20 +79,6 @@ class RankedFact:
         }
 
 
-async def _retry(coro_factory, *, max_retries: int = 2, delay: float = 1.0, label: str = "call"):
-    """Retry an async coroutine factory with exponential backoff."""
-    last_exc: Optional[Exception] = None
-    for attempt in range(max_retries + 1):
-        try:
-            return await coro_factory()
-        except Exception as e:
-            last_exc = e
-            if attempt < max_retries:
-                wait = delay * (2 ** attempt)
-                logger.warning("%s attempt %d failed: %s, retrying in %.1fs", label, attempt+1, e, wait)
-                await asyncio.sleep(wait)
-    raise last_exc  # type: ignore[misc]
-
 
 class ReadPipeline:
     """Honcho-style read pipeline with multi-signal ranking and dialectic reasoning."""
@@ -131,7 +118,7 @@ class ReadPipeline:
         raw_results = await vector_store.search(query_embedding, limit=self.config.recall.max_results * 3)
 
         # 3. Multi-signal scoring
-        ranked = self._rank(query_embedding, raw_results)
+        ranked = self.rank(query_embedding, raw_results)
 
         # 4. Filter by min_score
         ranked = [r for r in ranked if r.score >= self.config.recall.min_score]
@@ -191,7 +178,7 @@ class ReadPipeline:
 
         content = ""
         try:
-            content = await _retry(
+            content = await retry(
                 _call,
                 max_retries=self.config.pipeline.max_retries,
                 delay=self.config.pipeline.retry_delay,
@@ -221,7 +208,7 @@ class ReadPipeline:
                 "reasoning": str(e),
             }
 
-    def _rank(
+    def rank(
         self,
         query_embedding: list[float],
         raw_results: list[dict[str, Any]],
@@ -309,7 +296,7 @@ class ReadPipeline:
             return resp.data[0].embedding
 
         try:
-            return await _retry(
+            return await retry(
                 _call,
                 max_retries=self.config.pipeline.max_retries,
                 delay=self.config.pipeline.retry_delay,

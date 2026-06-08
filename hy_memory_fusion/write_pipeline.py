@@ -8,8 +8,6 @@ Responsibilities:
 """
 
 from __future__ import annotations
-
-import asyncio
 import json
 import logging
 import hashlib
@@ -20,6 +18,7 @@ from typing import Any, Optional
 from openai import AsyncOpenAI
 
 from hy_memory_fusion.config import FusionConfig
+from hy_memory_fusion._utils import retry
 
 logger = logging.getLogger(__name__)
 
@@ -85,21 +84,6 @@ class ExtractedFact:
         }
 
 
-async def _retry(coro_factory, *, max_retries: int = 2, delay: float = 1.0, label: str = "call"):
-    """Retry an async coroutine factory with exponential backoff."""
-    last_exc: Optional[Exception] = None
-    for attempt in range(max_retries + 1):
-        try:
-            return await coro_factory()
-        except Exception as e:
-            last_exc = e
-            if attempt < max_retries:
-                wait = delay * (2 ** attempt)
-                logger.warning(f"{label} attempt {attempt+1} failed: {e}, retrying in {wait:.1f}s")
-                await asyncio.sleep(wait)
-    raise last_exc  # type: ignore[misc]
-
-
 class WritePipeline:
     """Hy-Memory style write pipeline with SVO extraction and deduplication."""
 
@@ -143,10 +127,9 @@ class WritePipeline:
         for fact, emb in zip(raw_facts, embeddings):
             fact.embedding = emb
 
-        # Step 3: Dedup against existing facts
-        if existing_facts:
-            raw_facts = await self._dedup(raw_facts, existing_facts)
-            logger.info("After dedup: %d facts remain", len(raw_facts))
+        # Step 3: Dedup against existing + intra-batch
+        raw_facts = await self._dedup(raw_facts, existing_facts or [])
+        logger.info("After dedup: %d facts remain", len(raw_facts))
 
         return raw_facts
 
@@ -164,7 +147,7 @@ class WritePipeline:
             return response.choices[0].message.content or "[]"
 
         try:
-            content = await _retry(
+            content = await retry(
                 _call,
                 max_retries=self.config.pipeline.max_retries,
                 delay=self.config.pipeline.retry_delay,
@@ -205,9 +188,6 @@ class WritePipeline:
 
         Uses vector similarity (fast) first, then LLM judgment for borderline cases.
         """
-        if not existing_facts:
-            return new_facts
-
         # Build existing embeddings matrix
         existing_embeddings = []
         for ef in existing_facts:
@@ -271,7 +251,7 @@ class WritePipeline:
             return resp.data[0].embedding
 
         try:
-            return await _retry(
+            return await retry(
                 _call,
                 max_retries=self.config.pipeline.max_retries,
                 delay=self.config.pipeline.retry_delay,
@@ -300,7 +280,7 @@ class WritePipeline:
                 return [d.embedding for d in resp.data]
 
             try:
-                embeddings = await _retry(
+                embeddings = await retry(
                     _call,
                     max_retries=self.config.pipeline.max_retries,
                     delay=self.config.pipeline.retry_delay,

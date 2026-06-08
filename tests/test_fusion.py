@@ -165,7 +165,7 @@ class TestWritePipeline:
         writer = WritePipeline(
             config,
             mock_llm_client(svo_response),
-            mock_embed_client([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]),
+            mock_embed_client([[0.9, 0.1, 0.0, 0.0], [0.0, 0.0, 0.1, 0.9]]),
         )
 
         facts = await writer.ingest("Alice likes coffee. Bob is admin.")
@@ -173,7 +173,7 @@ class TestWritePipeline:
         assert facts[0].subject == "Alice"
         assert facts[0].importance == 0.7
         assert facts[1].subject == "Bob"
-        assert facts[0].embedding == [0.1, 0.2, 0.3, 0.4]
+        assert facts[0].embedding == [0.9, 0.1, 0.0, 0.0]
 
     @pytest.mark.asyncio
     async def test_ingest_dedup_removes_similar(self):
@@ -318,7 +318,7 @@ class TestReadPipeline:
             },
         ]
 
-        ranked = pipeline._rank(query_embedding, raw)
+        ranked = pipeline.rank(query_embedding, raw)
         assert len(ranked) == 2
         assert ranked[0].fact_id == "recent_important"
         assert ranked[0].score > ranked[1].score
@@ -347,13 +347,13 @@ class TestReadPipeline:
             {"fact_id": "high_imp", "text": "high", "embedding": [0.0, 1.0, 0.0, 0.0], "importance": 0.9, "created_at": "", "access_count": 0},
         ]
 
-        ranked = pipeline._rank(query_embedding, raw)
+        ranked = pipeline.rank(query_embedding, raw)
         # Even though "low_imp" has better semantic match, importance_weight=1.0 dominates
         assert ranked[0].fact_id == "high_imp"
 
     def test_rank_empty(self):
         pipeline = self._make_pipeline()
-        ranked = pipeline._rank([1, 0, 0, 0], [])
+        ranked = pipeline.rank([1, 0, 0, 0], [])
         assert ranked == []
 
     @pytest.mark.asyncio
@@ -508,3 +508,175 @@ class TestMemoryCore:
         core._qdrant.set_payload.assert_called_once()
         call_args = core._qdrant.set_payload.call_args
         assert call_args.kwargs["payload"]["access_count"] == 4
+
+
+# ── Retry Utility Tests ─────────────────────────────────────────────────
+
+
+class TestRetry:
+    @pytest.mark.asyncio
+    async def test_succeeds_first_try(self):
+        from hy_memory_fusion._utils import retry
+
+        call_count = 0
+
+        async def success():
+            nonlocal call_count
+            call_count += 1
+            return "ok"
+
+        result = await retry(success, max_retries=3, delay=0.01)
+        assert result == "ok"
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retries_on_failure(self):
+        from hy_memory_fusion._utils import retry
+
+        call_count = 0
+
+        async def fail_then_succeed():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ValueError("not yet")
+            return "done"
+
+        result = await retry(fail_then_succeed, max_retries=3, delay=0.01)
+        assert result == "done"
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_raises_after_exhausted(self):
+        from hy_memory_fusion._utils import retry
+
+        async def always_fail():
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await retry(always_fail, max_retries=2, delay=0.01)
+
+
+# ── Intra-batch Dedup Tests ─────────────────────────────────────────────
+
+
+class TestIntraBatchDedup:
+    @pytest.mark.asyncio
+    async def test_removes_duplicates_within_batch(self):
+        """Two facts with identical embeddings in same batch — second should be deduped."""
+        svo_response = json.dumps([
+            {"subject": "Alice", "relation": "likes", "object": "coffee", "importance": 0.7},
+            {"subject": "Alice", "relation": "enjoys", "object": "coffee", "importance": 0.6},
+        ])
+        config = make_config()
+        writer = WritePipeline(
+            config,
+            mock_llm_client(svo_response),
+            mock_embed_client([[0.9, 0.1, 0.0, 0.0], [0.9, 0.1, 0.0, 0.0]]),  # same embedding
+        )
+
+        facts = await writer.ingest("Alice likes coffee. Alice enjoys coffee.")
+        assert len(facts) == 1  # intra-batch dedup removes second
+
+    @pytest.mark.asyncio
+    async def test_keeps_different_facts_in_batch(self):
+        """Two facts with different embeddings — both should be kept."""
+        svo_response = json.dumps([
+            {"subject": "Alice", "relation": "likes", "object": "coffee", "importance": 0.7},
+            {"subject": "Bob", "relation": "runs", "object": "marathon", "importance": 0.6},
+        ])
+        config = make_config()
+        writer = WritePipeline(
+            config,
+            mock_llm_client(svo_response),
+            mock_embed_client([[0.9, 0.1, 0.0, 0.0], [0.0, 0.0, 0.9, 0.1]]),
+        )
+
+        facts = await writer.ingest("Alice likes coffee. Bob runs marathon.")
+        assert len(facts) == 2
+
+
+# ── Hybrid Search Mode Tests ────────────────────────────────────────────
+
+
+class TestHybridSearchModes:
+    @pytest.mark.asyncio
+    async def test_hybrid_mode_returns_ranked(self):
+        core = TestMemoryCore()._make_core()
+        now = datetime.now(timezone.utc).isoformat()
+        mock_point = MagicMock()
+        mock_point.id = "f1"
+        mock_point.score = 0.95
+        mock_point.payload = {"text": "test fact", "importance": 0.8, "created_at": now, "access_count": 5}
+        core._qdrant.search = AsyncMock(return_value=[mock_point])
+
+        results = await core.hybrid_search("test", mode="hybrid")
+        assert len(results) == 1
+        assert "semantic_score" in results[0]
+        assert "recency_score" in results[0]
+
+    @pytest.mark.asyncio
+    async def test_semantic_mode_returns_raw(self):
+        core = TestMemoryCore()._make_core()
+        mock_point = MagicMock()
+        mock_point.id = "f1"
+        mock_point.score = 0.95
+        mock_point.payload = {"text": "test fact", "importance": 0.8}
+        core._qdrant.search = AsyncMock(return_value=[mock_point])
+
+        results = await core.hybrid_search("test", mode="semantic")
+        assert len(results) == 1
+        assert results[0]["score"] == 0.95
+        # semantic mode should NOT have multi-signal fields
+        assert "semantic_score" not in results[0]
+
+
+# ── Config Edge Case Tests ──────────────────────────────────────────────
+
+
+class TestConfigEdgeCases:
+    def test_partial_env_overrides(self):
+        """Only some env vars set — others keep defaults."""
+        import os
+        # Clear any FUSION_ vars
+        for key in list(os.environ.keys()):
+            if key.startswith("FUSION_"):
+                del os.environ[key]
+
+        os.environ["FUSION_LLM_MODEL"] = "custom-model"
+        os.environ["FUSION_QDRANT_VECTOR_DIM"] = "512"
+
+        cfg = FusionConfig.from_env()
+        assert cfg.llm.model == "custom-model"
+        assert cfg.qdrant.vector_dim == 512
+        # Defaults preserved
+        assert cfg.llm.temperature == 0.1
+        assert cfg.distillation.dedup_threshold == 0.92
+        assert cfg.recall.semantic_weight == 0.6
+
+        # Cleanup
+        del os.environ["FUSION_LLM_MODEL"]
+        del os.environ["FUSION_QDRANT_VECTOR_DIM"]
+
+    def test_all_recall_weights_from_env(self):
+        """All four recall weights configurable via env."""
+        import os
+        for key in list(os.environ.keys()):
+            if key.startswith("FUSION_"):
+                del os.environ[key]
+
+        os.environ["FUSION_RECALL_SEMANTIC_WEIGHT"] = "0.5"
+        os.environ["FUSION_RECALL_RECENCY_WEIGHT"] = "0.2"
+        os.environ["FUSION_RECALL_IMPORTANCE_WEIGHT"] = "0.25"
+        os.environ["FUSION_RECALL_ACCESS_WEIGHT"] = "0.05"
+
+        cfg = FusionConfig.from_env()
+        assert cfg.recall.semantic_weight == 0.5
+        assert cfg.recall.recency_weight == 0.2
+        assert cfg.recall.importance_weight == 0.25
+        assert cfg.recall.access_weight == 0.05
+
+        # Cleanup
+        for key in ["FUSION_RECALL_SEMANTIC_WEIGHT", "FUSION_RECALL_RECENCY_WEIGHT",
+                     "FUSION_RECALL_IMPORTANCE_WEIGHT", "FUSION_RECALL_ACCESS_WEIGHT"]:
+            del os.environ[key]

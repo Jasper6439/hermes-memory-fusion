@@ -311,7 +311,7 @@ class MemoryCore:
             }
             for point in results
         ]
-        ranked = self._reader._rank(query_embedding, raw)
+        ranked = self._reader.rank(query_embedding, raw)
         return [r.to_dict() for r in ranked[:limit]]
 
     # ── Batch operations ─────────────────────────────────────────────────
