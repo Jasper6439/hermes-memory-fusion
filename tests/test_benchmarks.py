@@ -10,6 +10,7 @@ Tests measure and print timing; they fail only on unreasonable thresholds.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -243,7 +244,7 @@ class TestRankBenchmark:
         query_embedding = _deterministic_vector("query", DIM)
         raw = [
             {
-                "fact_id": f"f_{i}",
+                "fact_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"bench-fact:{i}")),
                 "text": f"fact number {i} about topic {i % 10}",
                 "embedding": _deterministic_vector(f"fact_{i}", DIM),
                 "importance": 0.3 + (i % 7) * 0.1,
@@ -262,7 +263,7 @@ class TestRankBenchmark:
         elapsed = time.perf_counter() - start
 
         print(f"\n  rank(100 facts, 128d): {elapsed:.4f}s")
-        assert len(ranked) == 10  # max_results
+        assert len(ranked) == 100  # rank returns all, search() applies limit
         assert elapsed < 1
 
     def test_rank_1000_facts(self):
@@ -273,7 +274,7 @@ class TestRankBenchmark:
         elapsed = time.perf_counter() - start
 
         print(f"\n  rank(1000 facts, 128d): {elapsed:.4f}s")
-        assert len(ranked) == 10
+        assert len(ranked) == 1000
         assert elapsed < 5
 
     def test_rank_10000_facts(self):
@@ -285,7 +286,7 @@ class TestRankBenchmark:
 
         print(f"\n  rank(10000 facts, 128d): {elapsed:.3f}s")
         print(f"  throughput: {10000/elapsed:.0f} facts/s")
-        assert len(ranked) == 10
+        assert len(ranked) == 10_000
         assert elapsed < 30
 
 
@@ -308,7 +309,7 @@ class TestQdrantBenchmark:
 
         points = [
             PointStruct(
-                id=f"f_{i}",
+                id=i,
                 vector=_deterministic_vector(f"fact_{i}", DIM),
                 payload={"text": f"fact {i}", "importance": 0.5, "user_id": "bench"},
             )
@@ -341,7 +342,7 @@ class TestQdrantBenchmark:
 
         points = [
             PointStruct(
-                id=f"f_{i}",
+                id=i,
                 vector=_deterministic_vector(f"fact_{i}", DIM),
                 payload={"text": f"fact {i}", "importance": 0.5},
             )
@@ -379,7 +380,7 @@ class TestQdrantBenchmark:
 
         points = [
             PointStruct(
-                id=f"f_{i}",
+                id=i,
                 vector=_deterministic_vector(f"fact_{i}", DIM),
                 payload={"text": f"fact {i}", "importance": 0.5},
             )
