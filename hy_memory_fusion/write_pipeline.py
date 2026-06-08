@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import hashlib
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -66,8 +67,8 @@ class ExtractedFact:
         if not self.text:
             self.text = f"{self.subject} {self.relation} {self.object}"
         if not self.fact_id:
-            h = hashlib.sha256(self.text.encode()).hexdigest()[:12]
-            self.fact_id = f"f_{h}"
+            h = hashlib.sha256(self.text.encode()).hexdigest()
+            self.fact_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hermes-fact:{h}"))
         if not self.created_at:
             self.created_at = datetime.now(timezone.utc).isoformat()
 

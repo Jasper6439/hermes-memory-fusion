@@ -182,7 +182,7 @@ class TestWritePipelineIntegration:
 
     @pytest.mark.asyncio
     async def test_ingest_with_real_dedup(self):
-        """Ingest same fact twice — second should be deduped."""
+        """Ingest same fact twice — second should be deduped via intra-batch."""
         config = _make_integration_config()
         config.distillation.dedup_threshold = 0.95
 
@@ -197,16 +197,18 @@ class TestWritePipelineIntegration:
             _mock_embed_client({"Bob runs marathon": same_embedding}),
         )
 
-        # First ingest
+        # First ingest — creates one fact
         facts1 = await writer.ingest("Bob runs marathon")
         assert len(facts1) == 1
 
-        # Dedup against the first batch (intra-batch)
-        facts2 = await writer._dedup(
-            [ExtractedFact(subject="Bob", relation="runs", object="marathon", importance=0.7)],
-            [{"text": "Bob runs marathon", "embedding": same_embedding}],
-        )
-        assert len(facts2) == 0  # deduped
+        # Create a new fact with same embedding and dedup against the first
+        new_fact = ExtractedFact(subject="Bob", relation="runs", object="marathon", importance=0.7)
+        new_fact.embedding = same_embedding  # same embedding as existing
+
+        existing = [{"text": "Bob runs marathon", "embedding": same_embedding}]
+
+        deduped = await writer._dedup([new_fact], existing)
+        assert len(deduped) == 0  # deduped because embeddings match
 
         # Cleanup
         from qdrant_client import AsyncQdrantClient

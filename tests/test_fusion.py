@@ -130,7 +130,7 @@ class TestExtractedFact:
     def test_auto_fields(self):
         fact = ExtractedFact(subject="Alice", relation="likes", object="coffee")
         assert fact.text == "Alice likes coffee"
-        assert fact.fact_id.startswith("f_")
+        assert len(fact.fact_id) == 36  # UUID format: 8-4-4-4-12
         assert fact.created_at  # auto-set
         assert fact.importance == 0.5
 
