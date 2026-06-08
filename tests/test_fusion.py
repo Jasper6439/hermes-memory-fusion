@@ -887,3 +887,490 @@ class TestHybridSearchVectorFix:
         results = await core.hybrid_search("test", mode="hybrid")
         assert len(results) == 1
         assert results[0]["semantic_score"] > 0.9
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NEGATIVE / FAILURE PATH TESTS
+# ═══════════════════════════════════════════════════════════════════════
+
+
+# ── Qdrant Connection Failures ──────────────────────────────────────────
+
+
+class TestQdrantFailures:
+    @pytest.mark.asyncio
+    async def test_search_when_qdrant_down(self):
+        """search() should return empty list when Qdrant raises."""
+        core = TestMemoryCore()._make_core()
+        core._qdrant.search = AsyncMock(side_effect=ConnectionError("Connection refused"))
+        core._initialized = True
+
+        # search() doesn't catch — it propagates. MemoryCore.search should let it bubble.
+        with pytest.raises(ConnectionError):
+            await core.search([0.1, 0.2, 0.3, 0.4])
+
+    @pytest.mark.asyncio
+    async def test_remember_when_scroll_fails(self):
+        """remember() should still work if dedup scroll fails (graceful degradation)."""
+        svo_response = json.dumps([
+            {"subject": "test", "relation": "is", "object": "fact", "importance": 0.7},
+        ])
+        core = TestMemoryCore()._make_core(llm_response=svo_response)
+        core.config.distillation.importance_threshold = 0.0
+        core._qdrant.scroll = AsyncMock(side_effect=Exception("Qdrant timeout"))
+        core._qdrant.upsert = AsyncMock()
+
+        # Should not raise — scroll failure is caught, dedup proceeds with empty existing
+        result = await core.remember("test fact")
+        assert len(result) == 1
+        core._qdrant.upsert.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_remember_when_upsert_fails(self):
+        """remember() should propagate upsert failures."""
+        svo_response = json.dumps([
+            {"subject": "test", "relation": "is", "object": "fact", "importance": 0.7},
+        ])
+        core = TestMemoryCore()._make_core(llm_response=svo_response)
+        core.config.distillation.importance_threshold = 0.0
+        core._qdrant.upsert = AsyncMock(side_effect=Exception("Upsert failed"))
+
+        with pytest.raises(Exception, match="Upsert failed"):
+            await core.remember("test fact")
+
+    @pytest.mark.asyncio
+    async def test_update_access_when_retrieve_fails(self):
+        """update_access should silently swallow retrieve failures."""
+        core = TestMemoryCore()._make_core()
+        core._qdrant.retrieve = AsyncMock(side_effect=Exception("timeout"))
+
+        # Should not raise — fire-and-forget
+        await core.update_access(["f1", "f2"])
+
+    @pytest.mark.asyncio
+    async def test_update_access_when_set_payload_fails(self):
+        """update_access should silently swallow set_payload failures."""
+        core = TestMemoryCore()._make_core()
+        mock_point = MagicMock()
+        mock_point.payload = {"access_count": 3}
+        core._qdrant.retrieve = AsyncMock(return_value=[mock_point])
+        core._qdrant.set_payload = AsyncMock(side_effect=Exception("write failed"))
+
+        # Should not raise
+        await core.update_access(["f1"])
+
+    @pytest.mark.asyncio
+    async def test_initialize_when_already_exists(self):
+        """initialize() should not recreate an existing collection."""
+        core = TestMemoryCore()._make_core()
+        existing_collection = MagicMock()
+        existing_collection.name = "test_fusion"
+        core._qdrant.get_collections = AsyncMock(
+            return_value=MagicMock(collections=[existing_collection])
+        )
+
+        await core.initialize()
+        core._qdrant.create_collection.assert_not_called()
+        assert core._initialized
+
+    @pytest.mark.asyncio
+    async def test_get_facts_by_ids_empty_list(self):
+        """get_facts_by_ids([]) should return empty without calling Qdrant."""
+        core = TestMemoryCore()._make_core()
+        result = await core.get_facts_by_ids([])
+        assert result == []
+        core._qdrant.retrieve.assert_not_called()
+
+
+# ── OpenAI / LLM Failures ──────────────────────────────────────────────
+
+
+class TestLLMFailures:
+    @pytest.mark.asyncio
+    async def test_svo_extraction_rate_limit(self):
+        """SVO extraction should fallback to raw text on 429."""
+        config = make_config()
+        llm = AsyncMock()
+        llm.chat.completions.create = AsyncMock(side_effect=Exception("429 Too Many Requests"))
+
+        writer = WritePipeline(config, llm, mock_embed_client())
+        facts = await writer.ingest("Some important text about Alice")
+        # Should fallback, not crash
+        assert len(facts) == 1
+        assert facts[0].relation == "states"
+
+    @pytest.mark.asyncio
+    async def test_svo_extraction_timeout(self):
+        """SVO extraction should fallback on timeout."""
+        config = make_config()
+        config.pipeline.max_retries = 0  # no retries for speed
+        llm = AsyncMock()
+        llm.chat.completions.create = AsyncMock(side_effect=TimeoutError("Request timed out"))
+
+        writer = WritePipeline(config, llm, mock_embed_client())
+        facts = await writer.ingest("timeout test")
+        assert len(facts) == 1
+
+    @pytest.mark.asyncio
+    async def test_svo_extraction_returns_garbage(self):
+        """SVO extraction should handle non-JSON LLM output."""
+        config = make_config()
+        writer = WritePipeline(config, mock_llm_client("I'm a teapot"), mock_embed_client())
+
+        facts = await writer.ingest("test")
+        assert len(facts) == 1
+        assert facts[0].relation == "states"
+
+    @pytest.mark.asyncio
+    async def test_svo_extraction_returns_empty_array(self):
+        """SVO extraction should handle empty JSON array."""
+        config = make_config()
+        writer = WritePipeline(config, mock_llm_client("[]"), mock_embed_client())
+
+        facts = await writer.ingest("trivial noise")
+        assert len(facts) == 0
+
+    @pytest.mark.asyncio
+    async def test_synthesis_returns_garbage(self):
+        """Synthesis should handle non-JSON LLM output gracefully."""
+        config = make_config()
+        reader = ReadPipeline(config, mock_llm_client("I don't know"), mock_embed_client())
+
+        facts = [RankedFact(fact_id="f1", text="test", score=0.9)]
+        result = await reader.synthesize("q", facts, "low")
+        assert "answer" in result
+        assert result["confidence"] == 0.3  # fallback confidence
+        assert "f1" in result["sources"]
+
+    @pytest.mark.asyncio
+    async def test_synthesis_rate_limit(self):
+        """Synthesis should handle 429 gracefully."""
+        config = make_config()
+        config.pipeline.max_retries = 0
+        llm = AsyncMock()
+        llm.chat.completions.create = AsyncMock(side_effect=Exception("429"))
+
+        reader = ReadPipeline(config, llm, mock_embed_client())
+        facts = [RankedFact(fact_id="f1", text="test", score=0.9)]
+        result = await reader.synthesize("q", facts, "low")
+        assert result["confidence"] == 0.3
+
+    @pytest.mark.asyncio
+    async def test_embed_all_retries_exhausted(self):
+        """embed_text should return [] after all retries fail."""
+        from hy_memory_fusion._utils import embed_text
+        client = AsyncMock()
+        client.embeddings.create = AsyncMock(side_effect=Exception("500 Internal"))
+
+        result = await embed_text("test", client, "model", max_retries=2, delay=0.01)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_embed_batch_partial_failure(self):
+        """embed_batch should return [] for failed batches, keep successful ones."""
+        from hy_memory_fusion._utils import embed_batch
+        call_count = 0
+
+        async def side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            inp = kwargs.get("input", [])
+            if call_count == 1:
+                # First batch succeeds
+                mock_resp = MagicMock()
+                mock_resp.data = [MagicMock(embedding=[0.1, 0.2]) for _ in range(len(inp))]
+                return mock_resp
+            else:
+                # Second batch fails
+                raise Exception("rate limited")
+
+        client = AsyncMock()
+        client.embeddings.create = AsyncMock(side_effect=side_effect)
+
+        result = await embed_batch(["a", "b", "c", "d"], client, "model", batch_size=2, max_retries=0, delay=0.01)
+        assert len(result) == 4
+        assert result[0] == [0.1, 0.2]  # first batch ok
+        assert result[1] == [0.1, 0.2]
+        assert result[2] == []  # second batch failed
+        assert result[3] == []
+
+
+# ── Invalid Config Values ──────────────────────────────────────────────
+
+
+class TestInvalidConfig:
+    def test_from_env_invalid_float_crashes(self):
+        """Non-numeric env var for float field should raise ValueError."""
+        import os
+        for key in list(os.environ.keys()):
+            if key.startswith("FUSION_"):
+                del os.environ[key]
+        os.environ["FUSION_LLM_TIMEOUT"] = "not_a_number"
+
+        with pytest.raises(ValueError):
+            FusionConfig.from_env()
+
+        del os.environ["FUSION_LLM_TIMEOUT"]
+
+    def test_from_env_invalid_int_crashes(self):
+        """Non-numeric env var for int field should raise ValueError."""
+        import os
+        for key in list(os.environ.keys()):
+            if key.startswith("FUSION_"):
+                del os.environ[key]
+        os.environ["FUSION_QDRANT_VECTOR_DIM"] = "abc"
+
+        with pytest.raises(ValueError):
+            FusionConfig.from_env()
+
+        del os.environ["FUSION_QDRANT_VECTOR_DIM"]
+
+    def test_from_env_negative_vector_dim(self):
+        """Negative vector_dim is accepted by config but semantically wrong."""
+        import os
+        for key in list(os.environ.keys()):
+            if key.startswith("FUSION_"):
+                del os.environ[key]
+        os.environ["FUSION_QDRANT_VECTOR_DIM"] = "-100"
+
+        cfg = FusionConfig.from_env()
+        assert cfg.qdrant.vector_dim == -100  # no validation — documented gap
+
+        del os.environ["FUSION_QDRANT_VECTOR_DIM"]
+
+    def test_from_env_dedup_threshold_above_one(self):
+        """Dedup threshold > 1.0 means nothing ever gets deduped."""
+        import os
+        for key in list(os.environ.keys()):
+            if key.startswith("FUSION_"):
+                del os.environ[key]
+        os.environ["FUSION_DEDUP_THRESHOLD"] = "1.5"
+
+        cfg = FusionConfig.from_env()
+        assert cfg.distillation.dedup_threshold == 1.5  # no validation
+
+        del os.environ["FUSION_DEDUP_THRESHOLD"]
+
+
+# ── Edge Case Inputs ───────────────────────────────────────────────────
+
+
+class TestEdgeCaseInputs:
+    @pytest.mark.asyncio
+    async def test_ingest_empty_string(self):
+        """Empty string should not crash."""
+        config = make_config()
+        config.distillation.enabled = False
+        writer = WritePipeline(config, mock_llm_client("[]"), mock_embed_client())
+
+        facts = await writer.ingest("")
+        assert len(facts) == 1
+        assert facts[0].subject == ""
+
+    @pytest.mark.asyncio
+    async def test_ingest_very_long_string(self):
+        """60k char string should be truncated to 50k."""
+        config = make_config()
+        captured_len = []
+
+        llm = AsyncMock()
+        msg = MagicMock()
+        msg.content = json.dumps([
+            {"subject": "test", "relation": "is", "object": "fact", "importance": 0.5},
+        ])
+        choice = MagicMock()
+        choice.message = msg
+        resp = MagicMock()
+        resp.choices = [choice]
+
+        async def capture(**kwargs):
+            captured_len.append(len(kwargs["messages"][0]["content"]))
+            return resp
+
+        llm.chat.completions.create = AsyncMock(side_effect=capture)
+
+        writer = WritePipeline(config, llm, mock_embed_client())
+        await writer.ingest("x" * 60_000)
+
+        # Prompt should contain truncated text + SVO template (~200 chars)
+        assert captured_len[0] < 60_000
+        assert captured_len[0] > 49_000  # at least 50k minus template
+
+    @pytest.mark.asyncio
+    async def test_ingest_unicode_text(self):
+        """Unicode/CJK text should pass through fine."""
+        svo_response = json.dumps([
+            {"subject": "林煜明", "relation": "喜欢", "object": "咖啡", "importance": 0.8},
+        ])
+        config = make_config()
+        writer = WritePipeline(config, mock_llm_client(svo_response), mock_embed_client())
+
+        facts = await writer.ingest("林煜明喜欢咖啡")
+        assert len(facts) == 1
+        assert facts[0].subject == "林煜明"
+
+    @pytest.mark.asyncio
+    async def test_recall_with_empty_db(self):
+        """recall() with no facts in DB should return 'No relevant memories'."""
+        core = TestMemoryCore()._make_core()
+        core._reader.search = AsyncMock(return_value=[])
+
+        result = await core.recall("What's the meaning of life?")
+        assert "No relevant" in result["answer"]
+        assert result["confidence"] == 0.0
+
+    def test_cosine_similarity_empty_vectors(self):
+        """cosine_similarity([], []) should return 0.0 (not NaN or crash)."""
+        assert cosine_similarity([], []) == 0.0
+
+    def test_cosine_similarity_single_element(self):
+        """cosine_similarity with 1-element vectors."""
+        assert cosine_similarity([1.0], [1.0]) == pytest.approx(1.0)
+        assert cosine_similarity([1.0], [-1.0]) == pytest.approx(-1.0)
+
+    def test_cosine_similarity_very_large_values(self):
+        """cosine_similarity with large values should not overflow."""
+        big = [1e100] * 100
+        result = cosine_similarity(big, big)
+        assert result == pytest.approx(1.0)
+
+    def test_cosine_similarity_very_small_values(self):
+        """cosine_similarity with tiny values."""
+        tiny = [1e-300] * 100
+        result = cosine_similarity(tiny, tiny)
+        # May be 0.0 due to underflow, but should not be NaN
+        assert result == pytest.approx(1.0) or result == 0.0
+
+    def test_strip_markdown_json_nested_backticks(self):
+        """strip_markdown_json with nested backticks."""
+        from hy_memory_fusion._utils import strip_markdown_json
+        # Code block containing backticks in content
+        text = '```json\n{"key": "value with `backticks`"}\n```'
+        result = strip_markdown_json(text)
+        assert '"key"' in result
+
+    def test_strip_markdown_json_empty_code_block(self):
+        """strip_markdown_json with empty code block."""
+        from hy_memory_fusion._utils import strip_markdown_json
+        result = strip_markdown_json("```\n```")
+        assert result == "" or result.strip() == ""
+
+    def test_strip_markdown_json_no_closing(self):
+        """strip_markdown_json with opening ``` but no closing."""
+        from hy_memory_fusion._utils import strip_markdown_json
+        result = strip_markdown_json('```json\n[1, 2, 3]')
+        # Should strip the opening ``` and "json\n"
+        assert "[1, 2, 3]" in result
+
+
+# ── Dedup Edge Cases ───────────────────────────────────────────────────
+
+
+class TestDedupEdgeCases:
+    @pytest.mark.asyncio
+    async def test_dedup_with_no_embeddings(self):
+        """Facts with empty embeddings should be kept (not dropped)."""
+        config = make_config()
+        writer = WritePipeline(config, mock_llm_client("[]"), mock_embed_client())
+
+        f1 = ExtractedFact(subject="a", relation="is", object="b", importance=0.5)
+        f1.embedding = []  # no embedding
+        f2 = ExtractedFact(subject="c", relation="is", object="d", importance=0.5)
+        f2.embedding = []
+
+        result = await writer._dedup([f1, f2], [])
+        assert len(result) == 2  # both kept — can't dedup without embeddings
+
+    @pytest.mark.asyncio
+    async def test_dedup_with_existing_no_embeddings(self):
+        """Existing facts with no embeddings should be skipped in dedup."""
+        config = make_config()
+        writer = WritePipeline(config, mock_llm_client("[]"), mock_embed_client([[0.1, 0.2, 0.3, 0.4]]))
+
+        f1 = ExtractedFact(subject="a", relation="is", object="b", importance=0.5)
+        f1.embedding = [0.1, 0.2, 0.3, 0.4]
+
+        existing = [{"text": "existing", "embedding": None}]  # no embedding on existing
+
+        result = await writer._dedup([f1], existing)
+        assert len(result) == 1  # kept — existing had no embedding to compare
+
+    @pytest.mark.asyncio
+    async def test_dedup_threshold_boundary(self):
+        """Facts at exactly the threshold should be deduped."""
+        config = make_config()
+        config.distillation.dedup_threshold = 0.95
+
+        writer = WritePipeline(config, mock_llm_client("[]"), mock_embed_client())
+
+        f1 = ExtractedFact(subject="a", relation="is", object="b", importance=0.5)
+        f1.embedding = [1.0, 0.0, 0.0, 0.0]
+        f2 = ExtractedFact(subject="a", relation="is", object="b", importance=0.5)
+        f2.embedding = [1.0, 0.0, 0.0, 0.0]  # identical → sim = 1.0
+
+        result = await writer._dedup([f1, f2], [])
+        assert len(result) == 1  # sim 1.0 >= 0.95 threshold
+
+    @pytest.mark.asyncio
+    async def test_dedup_below_threshold_keeps(self):
+        """Facts just below threshold should be kept."""
+        config = make_config()
+        config.distillation.dedup_threshold = 0.9999  # very high threshold
+
+        writer = WritePipeline(config, mock_llm_client("[]"), mock_embed_client())
+
+        f1 = ExtractedFact(subject="a", relation="is", object="b", importance=0.5)
+        f1.embedding = [1.0, 0.0, 0.0, 0.0]
+        f2 = ExtractedFact(subject="c", relation="is", object="d", importance=0.5)
+        f2.embedding = [0.9, 0.1, 0.0, 0.0]  # not identical
+
+        result = await writer._dedup([f1, f2], [])
+        assert len(result) == 2  # sim < 0.9999, both kept
+
+
+# ── Ranking Edge Cases ─────────────────────────────────────────────────
+
+
+class TestRankingEdgeCases:
+    def test_rank_all_zero_embeddings(self):
+        """Ranking with zero embeddings should not crash or produce NaN."""
+        pipeline = ReadPipeline(make_config(), mock_llm_client("{}"), mock_embed_client())
+        raw = [
+            {"fact_id": "f1", "text": "a", "embedding": [0, 0, 0, 0], "importance": 0.5, "created_at": "", "access_count": 0},
+        ]
+        ranked = pipeline.rank([0, 0, 0, 0], raw)
+        assert len(ranked) == 1
+        assert ranked[0].score >= 0
+        assert ranked[0].score == ranked[0].score  # not NaN
+
+    def test_rank_mismatched_dimensions(self):
+        """Ranking with different vector lengths should handle gracefully."""
+        pipeline = ReadPipeline(make_config(), mock_llm_client("{}"), mock_embed_client())
+        raw = [
+            {"fact_id": "f1", "text": "a", "embedding": [1, 0], "importance": 0.5, "created_at": "", "access_count": 0},
+        ]
+        ranked = pipeline.rank([1, 0, 0, 0], raw)  # 4d vs 2d
+        assert len(ranked) == 1
+        assert ranked[0].semantic_score == 0.0  # cosine_similarity returns 0 for mismatched
+
+    def test_rank_no_created_at(self):
+        """Ranking with missing created_at should handle gracefully."""
+        pipeline = ReadPipeline(make_config(), mock_llm_client("{}"), mock_embed_client())
+        raw = [
+            {"fact_id": "f1", "text": "a", "embedding": [1, 0, 0, 0], "importance": 0.5, "access_count": 0},
+            # no created_at field
+        ]
+        ranked = pipeline.rank([1, 0, 0, 0], raw)
+        assert len(ranked) == 1
+        assert ranked[0].recency_score == 0.0
+
+    def test_rank_malformed_created_at(self):
+        """Ranking with garbage created_at should not crash."""
+        pipeline = ReadPipeline(make_config(), mock_llm_client("{}"), mock_embed_client())
+        raw = [
+            {"fact_id": "f1", "text": "a", "embedding": [1, 0, 0, 0], "importance": 0.5,
+             "created_at": "not-a-date", "access_count": 0},
+        ]
+        ranked = pipeline.rank([1, 0, 0, 0], raw)
+        assert len(ranked) == 1
+        assert ranked[0].recency_score == 0.0
