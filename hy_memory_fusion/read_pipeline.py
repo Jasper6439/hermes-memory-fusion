@@ -115,7 +115,7 @@ class ReadPipeline:
             return []
 
         # 2. Vector search (semantic baseline)
-        raw_results = await vector_store.search(query_embedding, limit=self.config.recall.max_results * 3)
+        raw_results = await vector_store.search(query_embedding, limit=self.config.recall.max_results * 3, user_id=user_id)
 
         # 3. Multi-signal scoring
         ranked = self.rank(query_embedding, raw_results)

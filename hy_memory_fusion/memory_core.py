@@ -203,15 +203,23 @@ class MemoryCore:
         self,
         query_embedding: list[float],
         limit: int = 20,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search Qdrant by vector similarity.
 
         This is the vector_store interface that ReadPipeline.search() calls.
         """
+        qdrant_filter = None
+        if user_id:
+            qdrant_filter = Filter(
+                must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+            )
+
         response = await self._qdrant.query_points(
             collection_name=self._collection,
             query=query_embedding,
             limit=limit,
+            query_filter=qdrant_filter,
             with_payload=True,
             with_vectors=True,
         )
