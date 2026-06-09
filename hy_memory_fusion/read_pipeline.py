@@ -126,9 +126,12 @@ class ReadPipeline:
         # 5. Trim to max_results
         ranked = ranked[: self.config.recall.max_results]
 
-        # 6. Update access counters (fire-and-forget)
+        # 6. Update access counters (tracked task)
         if ranked:
-            asyncio.create_task(self._update_access(vector_store, [r.fact_id for r in ranked]))
+            task = asyncio.create_task(self._update_access(vector_store, [r.fact_id for r in ranked]))
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            if hasattr(vector_store, "_pending_tasks"):
+                vector_store._pending_tasks.append(task)
 
         return ranked
 
@@ -150,6 +153,11 @@ class ReadPipeline:
         """
         if not facts:
             return {"answer": "No relevant memories found.", "confidence": 0.0, "sources": [], "reasoning": ""}
+
+        valid_levels = {"minimal", "low", "medium", "high", "max"}
+        if reasoning_level not in valid_levels:
+            logger.warning("Invalid reasoning_level '%s', falling back to 'low'", reasoning_level)
+            reasoning_level = "low"
 
         # Format facts for prompt
         memory_text = "\n".join(

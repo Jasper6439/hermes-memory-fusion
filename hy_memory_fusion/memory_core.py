@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, Literal
 
@@ -41,7 +42,6 @@ class MemoryCore:
         self,
         config: Optional[FusionConfig] = None,
         qdrant_client: Optional[AsyncQdrantClient] = None,
-        llm_client: Optional[AsyncOpenAI] = None,
         embed_client: Optional[AsyncOpenAI] = None,
         reader_client: Optional[AsyncOpenAI] = None,
         writer_client: Optional[AsyncOpenAI] = None,
@@ -69,11 +69,13 @@ class MemoryCore:
             timeout=self.config.reader.timeout,
         )
 
-        # Generic LLM client (for backward compat)
-        self._llm_client = llm_client or self._writer_client
+        # Generic LLM client (backward compat removed)
 
         # Qdrant client
-        self._qdrant = qdrant_client or AsyncQdrantClient(url=self.config.qdrant.url)
+        self._qdrant = qdrant_client or AsyncQdrantClient(
+            url=self.config.qdrant.url,
+            api_key=self.config.qdrant.api_key or None,
+        )
         self._collection = self.config.qdrant.collection
 
         # Pipelines
@@ -89,6 +91,25 @@ class MemoryCore:
         )
 
         self._initialized = False
+        self._pending_tasks: list[asyncio.Task] = []
+
+    async def close(self) -> None:
+        for client_attr in ("_embed_client", "_writer_client", "_reader_client"):
+            client = getattr(self, client_attr, None)
+            if client and hasattr(client, "close"):
+                await client.close()
+        if self._qdrant and hasattr(self._qdrant, "close"):
+            await self._qdrant.close()
+        for task in self._pending_tasks:
+            if not task.done():
+                task.cancel()
+        self._pending_tasks.clear()
+
+    async def __aenter__(self) -> "MemoryCore":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
 
     async def initialize(self) -> None:
         """Create Qdrant collection if not exists."""
@@ -129,9 +150,12 @@ class MemoryCore:
                 # representative sample here for batch dedup.
                 all_points = await self._qdrant.scroll(
                     collection_name=self._collection,
-                    limit=500,
+                    limit=self.config.distillation.scroll_limit,
                     with_payload=True,
                     with_vectors=True,
+                    scroll_filter=Filter(
+                        must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+                    ) if user_id else None,
                 )
                 for point in all_points[0]:
                     payload = point.payload or {}
@@ -159,9 +183,11 @@ class MemoryCore:
             payload = fact.to_dict()
             payload["user_id"] = user_id
             payload["access_count"] = 0
+            scoped_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hermes-fact:{user_id}:{fact.fact_id}"))
+            payload["fact_id"] = scoped_id
             points.append(
                 PointStruct(
-                    id=fact.fact_id,
+                    id=scoped_id,
                     vector=fact.embedding,
                     payload=payload,
                 )
@@ -174,7 +200,15 @@ class MemoryCore:
             )
             logger.info("Stored %d facts for user %s", len(points), user_id)
 
-        return [f.to_dict() for f in facts]
+        stored_facts = []
+        for fact in facts:
+            if not fact.embedding:
+                continue
+            d = fact.to_dict()
+            scoped_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hermes-fact:{user_id}:{fact.fact_id}"))
+            d["fact_id"] = scoped_id
+            stored_facts.append(d)
+        return stored_facts
 
     async def recall(
         self,
@@ -203,7 +237,7 @@ class MemoryCore:
         self,
         query_embedding: list[float],
         limit: int = 20,
-        user_id: str | None = None,
+        user_id: str | None = "default",
     ) -> list[dict[str, Any]]:
         """Search Qdrant by vector similarity.
 

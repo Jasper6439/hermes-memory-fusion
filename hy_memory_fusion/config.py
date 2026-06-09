@@ -46,6 +46,7 @@ class DistillationConfig:
     enabled: bool = True
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.92
+    scroll_limit: int = 500
 
 
 @dataclass
@@ -168,6 +169,8 @@ class FusionConfig:
             cfg.distillation.enabled = v.lower() in ("1", "true", "yes")
         if v := os.getenv("FUSION_DEDUP_THRESHOLD"):
             cfg.distillation.dedup_threshold = float(v)
+        if v := os.getenv("FUSION_SCROLL_LIMIT"):
+            cfg.distillation.scroll_limit = int(v)
 
         # Recall
         if v := os.getenv("FUSION_RECALL_MAX_RESULTS"):

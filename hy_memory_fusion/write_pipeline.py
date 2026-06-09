@@ -38,16 +38,6 @@ Text:
 
 Return ONLY valid JSON array, no markdown."""
 
-DEDUP_PROMPT = """Given a new fact and a list of existing facts, determine which existing facts
-are semantically duplicates of the new one.
-
-New fact: {new_fact}
-
-Existing facts:
-{existing_facts}
-
-Return a JSON array of indices (0-based) of duplicate facts. Return [] if no duplicates."""
-
 
 @dataclass
 class ExtractedFact:

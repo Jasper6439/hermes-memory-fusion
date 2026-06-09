@@ -404,7 +404,6 @@ class TestMemoryCore:
         core = MemoryCore(
             config=config,
             qdrant_client=mock_qdrant,
-            llm_client=mock_llm_client(llm_response),
             embed_client=mock_embed_client(embed_resp),
             reader_client=mock_llm_client("{}"),
             writer_client=mock_llm_client(llm_response),
@@ -1374,3 +1373,126 @@ class TestRankingEdgeCases:
         ranked = pipeline.rank([1, 0, 0, 0], raw)
         assert len(ranked) == 1
         assert ranked[0].recency_score == 0.0
+
+
+# ── Round 5 Fix Tests ───────────────────────────────────────────────────
+
+
+class TestQdrantApiKey:
+    def test_api_key_passed_to_client(self):
+        config = make_config()
+        config.qdrant.api_key = "test-secret-key"
+        core = MemoryCore(config=config)
+        assert core.config.qdrant.api_key == "test-secret-key"
+
+    def test_empty_api_key_passes_none(self):
+        config = make_config()
+        config.qdrant.api_key = ""
+        core = MemoryCore(config=config)
+        assert core.config.qdrant.api_key == ""
+
+
+class TestFactIdScoping:
+    @pytest.mark.asyncio
+    async def test_different_users_different_fact_ids(self):
+        svo_response = json.dumps([
+            {"subject": "Alice", "relation": "likes", "object": "coffee", "importance": 0.7},
+        ])
+        config = make_config()
+        config.distillation.importance_threshold = 0.0
+        captured_ids = []
+        mock_qdrant = AsyncMock()
+        mock_qdrant.get_collections = AsyncMock(return_value=MagicMock(collections=[]))
+        mock_qdrant.create_collection = AsyncMock()
+        mock_qdrant.scroll = AsyncMock(return_value=([], None))
+        async def capture_upsert(**kwargs):
+            for p in kwargs.get("points", []):
+                captured_ids.append(p.id)
+        mock_qdrant.upsert = AsyncMock(side_effect=capture_upsert)
+        core = MemoryCore(
+            config=config, qdrant_client=mock_qdrant,
+            writer_client=mock_llm_client(svo_response),
+            embed_client=mock_embed_client([[0.9, 0.1, 0.0, 0.0]]),
+            reader_client=mock_llm_client("{}"),
+        )
+        await core.remember("Alice likes coffee", user_id="user_A")
+        await core.remember("Alice likes coffee", user_id="user_B")
+        assert len(captured_ids) == 2
+        assert captured_ids[0] != captured_ids[1]
+
+
+class TestResourceCleanup:
+    @pytest.mark.asyncio
+    async def test_close_releases_clients(self):
+        core = MemoryCore.__new__(MemoryCore)
+        core._embed_client = AsyncMock()
+        core._writer_client = AsyncMock()
+        core._reader_client = AsyncMock()
+        core._qdrant = AsyncMock()
+        core._pending_tasks = []
+        core._initialized = True
+        await core.close()
+
+    @pytest.mark.asyncio
+    async def test_context_manager(self):
+        config = make_config()
+        mock_qdrant = AsyncMock()
+        mock_qdrant.get_collections = AsyncMock(return_value=MagicMock(collections=[]))
+        mock_qdrant.create_collection = AsyncMock()
+        async with MemoryCore(config=config, qdrant_client=mock_qdrant) as core:
+            assert isinstance(core, MemoryCore)
+
+
+class TestReasoningLevelValidation:
+    @pytest.mark.asyncio
+    async def test_invalid_level_falls_back(self):
+        synthesis_response = json.dumps({"answer": "test", "confidence": 0.8, "sources": [], "reasoning": ""})
+        pipeline = ReadPipeline(make_config(), mock_llm_client(synthesis_response), mock_embed_client())
+        facts = [RankedFact(fact_id="f1", text="test", score=0.9)]
+        result = await pipeline.synthesize("test", facts, "INVALID_LEVEL")
+        assert result["answer"] == "test"
+
+    @pytest.mark.asyncio
+    async def test_valid_levels_accepted(self):
+        synthesis_response = json.dumps({"answer": "ok", "confidence": 0.8, "sources": [], "reasoning": ""})
+        for level in ("minimal", "low", "medium", "high", "max"):
+            pipeline = ReadPipeline(make_config(), mock_llm_client(synthesis_response), mock_embed_client())
+            facts = [RankedFact(fact_id="f1", text="test", score=0.9)]
+            result = await pipeline.synthesize("test", facts, level)
+            assert result["answer"] == "ok"
+
+
+class TestRememberReturnSemantics:
+    @pytest.mark.asyncio
+    async def test_returns_only_stored_facts(self):
+        svo_response = json.dumps([{"subject": "Alice", "relation": "likes", "object": "coffee", "importance": 0.7}])
+        config = make_config()
+        config.distillation.importance_threshold = 0.0
+        mock_embed = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.data = [MagicMock(embedding=[])]
+        mock_embed.embeddings.create = AsyncMock(return_value=mock_resp)
+        mock_qdrant = AsyncMock()
+        mock_qdrant.get_collections = AsyncMock(return_value=MagicMock(collections=[]))
+        mock_qdrant.create_collection = AsyncMock()
+        mock_qdrant.scroll = AsyncMock(return_value=([], None))
+        mock_qdrant.upsert = AsyncMock()
+        core = MemoryCore(
+            config=config, qdrant_client=mock_qdrant,
+            writer_client=mock_llm_client(svo_response),
+            embed_client=mock_embed, reader_client=mock_llm_client("{}"),
+        )
+        result = await core.remember("test")
+        mock_qdrant.upsert.assert_not_called()
+        assert result == []
+
+
+class TestScrollLimitConfig:
+    def test_default_scroll_limit(self):
+        config = FusionConfig()
+        assert config.distillation.scroll_limit == 500
+
+    def test_env_scroll_limit(self, monkeypatch):
+        monkeypatch.setenv("FUSION_SCROLL_LIMIT", "1000")
+        cfg = FusionConfig.from_env()
+        assert cfg.distillation.scroll_limit == 1000
